@@ -4,13 +4,15 @@ A Telegram bot that runs the CML purchase-order approval flow and stores everyth
 
 ## Flow
 
-1. **Requester** (DM with the bot) — `/new`, picks items from the master list, sets quantities, marks urgent, submits.
+1. **Requester** (DM with the bot) — `/new`, picks a **category**: **Laboratory consumption** (pick from the master list) or **Other** (admin/office supplies — free entry: item, qty, price, supplier; no material code). Then adds items + quantities, enters a short **reason/purpose**, marks urgent, submits.
 2. **Stock controller** (group) — Approve / Reject.
-3. **Bookkeeping** (group) — receives the generated PO PDF, books in QBO, taps Booked / Reject.
+3. **Bookkeeping** (group) — books in QBO, taps Booked / Reject.
 4. **Finance manager** (group) — Approve / Reject.
 5. Then it branches:
    - **Not urgent** → General manager (Approve) → Board of director (Approve) → Approved.
    - **Urgent** → approved straight after Finance; GM and Board are notified for information only.
+
+**Every stage receives the PO as a 2-page PDF** (attached to the group message). **Page 1 is the order** — the copy you send the supplier (PO no., date, supplier, items with a **Code** column, pack, qty, price, total). **Page 2 is the internal approval trail** that updates as the PO advances, so each approver sees who signed off before them. The chat summary stays clean (no codes). The PDF uses a bundled Khmer font (`fonts/Battambang.ttf`) with HarfBuzz shaping, so Khmer names render correctly. `generate_po_pdf(..., supplier_copy=True)` produces page 1 only — a clean supplier copy (used by the upcoming send-to-supplier step). Each line item also gets a tracking ref (`PO-line`, e.g. `172-1`) stored in the `Line_Items` sheet.
 
 The bot auto-fills unit price + supplier from your master list and computes totals. **The requester never sees prices or totals** — they pick items and quantities; pricing appears only to the Stock/Bookkeeping/Finance/GM/Board groups and on the PDF. One supplier per PO. A reject at any stage goes back to the requester with the reason; after they fix it, the PO **re-runs from the Stock controller**.
 
@@ -20,6 +22,7 @@ Use your existing **Supplier MasterList** sheet. Copy its ID from the URL into `
 
 - **Master list** — your existing tab (default name `Table1`; change with `MASTER_TAB`). Columns are matched by name, so `No. / Material Code / CML Reagent / Supplier / Supplier Reagent / Price / Pack` works as-is. The requester searches by **CML Reagent**; **Price** is used for totals but never shown to the requester. The bot only reads this tab — it never edits it.
 - **POs** and **Line_Items** — created automatically (in the same sheet, or in a separate `SPREADSHEET_ID` if you set `MASTER_SPREADSHEET_ID` to point the master elsewhere).
+- **Other_Items** — created automatically; a reusable list for the **Other** category (columns: item, unit_price, supplier). The bot suggests from it and appends new entries you add on the fly.
 
 ## Deploy on Railway
 
@@ -54,5 +57,5 @@ python bot.py
 - `bot.py` — handlers + approval state machine
 - `flow.py` — stage order, transitions, keyboards, summary text
 - `sheets.py` — Google Sheets storage (gspread)
-- `pdf.py` — PO PDF generation (reportlab)
+- `pdf.py` — PO PDF generation (fpdf2 + HarfBuzz shaping; uses `fonts/Battambang.ttf`)
 - `config.py` — environment-variable config

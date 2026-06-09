@@ -1,4 +1,5 @@
 python-telegram-bot==21.6
 gspread==6.1.2
 google-auth==2.34.0
-reportlab==4.2.2
+fpdf2==2.8.7
+uharfbuzz==0.55.0

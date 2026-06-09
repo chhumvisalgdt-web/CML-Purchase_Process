@@ -1,4 +1,6 @@
-"""Stage order, transitions, labels, keyboards and the PO summary text."""
+"""Stage order, transitions, keyboards, and the PO summary text (HTML-formatted)."""
+import html
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import Config
 
@@ -20,7 +22,6 @@ STAGE_LABEL = {
     "returned": "Returned to requester",
 }
 
-# Audit columns (in the POs sheet) written when a stage acts
 STAGE_AUDIT = {
     "stock": ("stock_by", "stock_at"),
     "book": ("book_by", "book_at"),
@@ -29,9 +30,28 @@ STAGE_AUDIT = {
     "board": ("board_by", "board_at"),
 }
 
+# Past-tense verb shown when a stage acts (default "Approved")
+ACTION_VERB = {"stock": "Checked", "book": "Booked"}
+# Short position tag shown in the action line (only these stages)
+POSITION = {"fin": "FM", "gm": "GM", "board": "BoD"}
+
+BOLT = "\u26a1"  # ⚡
+
+# PO categories the requester picks at /new
+CATEGORY_LABEL = {"lab": "Laboratory consumption", "other": "Other"}
+CATEGORY_CODE = {v.lower(): k for k, v in CATEGORY_LABEL.items()}
+
 
 def is_urgent(po):
     return str(po.get("urgent", "")).strip().lower() in ("yes", "true", "1")
+
+
+def action_verb(stage):
+    return ACTION_VERB.get(stage, "Approved")
+
+
+def position(stage):
+    return POSITION.get(stage)
 
 
 def next_stage(stage, urgent):
@@ -54,7 +74,11 @@ def positive_action(stage):
 
 
 def positive_label(stage):
-    return "Booked" if stage == STAGE_BOOK else "Approve"
+    if stage == STAGE_STOCK:
+        return "Checked"
+    if stage == STAGE_BOOK:
+        return "Booked"
+    return "Approve"
 
 
 def action_keyboard(stage, po_no):
@@ -72,22 +96,30 @@ def money(value):
         return f"{Config.CURRENCY}{value}"
 
 
+def _item_line(it):
+    name = html.escape(str(it.get("item", "")))
+    pack = f" ({html.escape(str(it['pack']))})" if it.get("pack") else ""
+    return (f"- {name} \u00d7{it.get('qty', 0)}{pack} "
+            f"@ {money(it.get('unit_price', 0))} = {money(it.get('line_total', 0))}")
+
+
 def po_summary(po, items, header=None):
-    lines = []
-    title = f"PO #{po['po_no']}"
-    if is_urgent(po):
-        title += "   \u26a1 URGENT"
-    lines.append(title)
+    """HTML-formatted summary posted to the approver groups."""
+    e = html.escape
+    supplier = e(str(po.get("supplier", "")))
+    requester = e(str(po.get("requester_name", "")))
+    total = money(po.get("total", 0))
+
+    head = f"PO #{po['po_no']}"
+    category = str(po.get("category", "")).strip()
+    if category:
+        head += f" \u00b7 {e(category)}"
     if header:
-        lines.append(header)
-    lines.append("")
-    lines.append(f"Requester: {po.get('requester_name', '')}")
-    lines.append(f"Supplier: {po.get('supplier', '')}")
-    lines.append("Items:")
-    for it in items:
-        pack = f"  ({it['pack']})" if it.get("pack") else ""
-        lines.append(
-            f"  \u2022 {it['item']}  \u00d7{it['qty']}{pack}  @ {money(it['unit_price'])}  = {money(it['line_total'])}"
-        )
-    lines.append(f"Total: {money(po.get('total', 0))}")
+        head += f"  {e(header)}"
+    if is_urgent(po):
+        head += f"  {BOLT} URGENT"
+
+    lines = [head, f"Requestor: {requester}  |  To: {supplier}", ""]
+    lines += [_item_line(it) for it in items]
+    lines.append(f"<b>Total: {total}</b>")
     return "\n".join(lines)

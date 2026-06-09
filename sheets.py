@@ -25,10 +25,12 @@ PO_HEADERS = [
     "total", "urgent", "stage", "status",
     "stock_by", "stock_at", "book_by", "book_at", "fin_by", "fin_at",
     "gm_by", "gm_at", "board_by", "board_at",
-    "reject_stage", "reject_reason", "updated_at",
+    "reject_stage", "reject_reason", "updated_at", "reason", "category",
 ]
-LINE_HEADERS = ["po_no", "material_code", "item", "supplier_reagent", "pack",
+LINE_HEADERS = ["po_no", "line_id", "material_code", "item", "supplier_reagent", "pack",
                 "qty", "unit_price", "line_total"]
+# Reusable reference list for the "Other" category (bot reads and appends to it)
+OTHER_HEADERS = ["item", "unit_price", "supplier"]
 
 
 def _to_float(v):
@@ -52,6 +54,8 @@ class Sheets:
         self._msh = None      # master spreadsheet (may be the same object)
         self._master_cache = None
         self._master_cache_at = 0.0
+        self._other_cache = None
+        self._other_cache_at = 0.0
 
     # ---- clients ----
     def _client(self):
@@ -90,6 +94,7 @@ class Sheets:
     def ensure_tabs(self):
         self._ws("POs", PO_HEADERS)
         self._ws("Line_Items", LINE_HEADERS)
+        self._ws("Other_Items", OTHER_HEADERS)
         # If the master list is meant to be in the main spreadsheet, make sure the tab exists.
         mid = Config.MASTER_SPREADSHEET_ID or Config.SPREADSHEET_ID
         if mid == Config.SPREADSHEET_ID:
@@ -168,6 +173,48 @@ class Sheets:
         by_name = {m["item"]: m for m in master}
         return [by_name[x] for x in chosen]
 
+    # ---- "Other" reusable list ----
+    def get_other_master(self, force=False):
+        if (not force) and self._other_cache is not None and (time.time() - self._other_cache_at) < 300:
+            return self._other_cache
+        ws = self._ws("Other_Items", OTHER_HEADERS)
+        out = []
+        for r in ws.get_all_records(expected_headers=OTHER_HEADERS):
+            name = str(r.get("item", "")).strip()
+            if not name:
+                continue
+            out.append({
+                "item": name,
+                "unit_price": _to_float(r.get("unit_price")),
+                "supplier": str(r.get("supplier", "")).strip(),
+                "material_code": "", "supplier_reagent": "", "pack": "",
+            })
+        self._other_cache, self._other_cache_at = out, time.time()
+        return out
+
+    def find_other_item(self, name):
+        name_l = name.strip().lower()
+        for m in self.get_other_master():
+            if m["item"].lower() == name_l:
+                return m
+        return None
+
+    def suggest_other_items(self, name, n=6):
+        master = self.get_other_master()
+        names = [m["item"] for m in master]
+        matches = difflib.get_close_matches(name, names, n=n, cutoff=0.4)
+        subs = [x for x in names if name.strip().lower() in x.lower() and x not in matches]
+        chosen = (matches + subs)[:n]
+        by_name = {m["item"]: m for m in master}
+        return [by_name[x] for x in chosen]
+
+    def add_other_item(self, item, unit_price, supplier):
+        if self.find_other_item(item):
+            return
+        ws = self._ws("Other_Items", OTHER_HEADERS)
+        ws.append_row([item, unit_price, supplier], value_input_option="USER_ENTERED")
+        self._other_cache = None
+
     # ---- PO numbering ----
     def next_po_no(self):
         ws = self._ws("POs", PO_HEADERS)
@@ -219,8 +266,10 @@ class Sheets:
     # ---- line items ----
     def add_line_items(self, po_no, items):
         ws = self._ws("Line_Items", LINE_HEADERS)
-        rows = [[po_no, it.get("material_code", ""), it["item"], it.get("supplier_reagent", ""),
-                 it.get("pack", ""), it["qty"], it["unit_price"], it["line_total"]] for it in items]
+        rows = [[po_no, f"{po_no}-{i}", it.get("material_code", ""), it["item"],
+                 it.get("supplier_reagent", ""), it.get("pack", ""),
+                 it["qty"], it["unit_price"], it["line_total"]]
+                for i, it in enumerate(items, 1)]
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
 
@@ -230,6 +279,7 @@ class Sheets:
         for r in ws.get_all_records(expected_headers=LINE_HEADERS):
             if str(r.get("po_no")).strip() == str(po_no):
                 out.append({
+                    "line_id": str(r.get("line_id", "")),
                     "material_code": str(r.get("material_code", "")),
                     "item": str(r.get("item", "")),
                     "supplier_reagent": str(r.get("supplier_reagent", "")),

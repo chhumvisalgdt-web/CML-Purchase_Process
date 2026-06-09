@@ -1,17 +1,38 @@
-"""Generate an in-memory Purchase Order PDF with reportlab (CML brand colors)."""
+"""Generate an in-memory Purchase Order PDF with fpdf2 + HarfBuzz shaping.
+
+Page 1 = the order (supplier-facing copy). Page 2 = internal approval trail.
+Pass supplier_copy=True to produce page 1 only (a clean copy for the supplier).
+Uses the bundled Battambang font (Khmer + Latin) so Khmer names render correctly.
+"""
+import os
 from io import BytesIO
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from fpdf import FPDF
+from fpdf.fonts import FontFace
 
 from config import Config
 
-TEAL = colors.HexColor("#187B85")
-ORANGE = colors.HexColor("#C67D1F")
-GREY = colors.HexColor("#BBBBBB")
+FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang.ttf")
+FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang-Bold.ttf")
+FONT = "Battambang"
+
+TEAL = (24, 123, 133)
+ORANGE = (198, 125, 31)
+GREY = (90, 90, 90)
+WHITE = (255, 255, 255)
+
+STAGE_LABEL = {
+    "stock": "Stock controller", "book": "Bookkeeping", "fin": "Finance manager",
+    "gm": "General manager", "board": "Board of director",
+    "approved": "Approved", "returned": "Returned to requester",
+}
+STAGES = [
+    ("Stock controller", "stock"),
+    ("Bookkeeping", "book"),
+    ("Finance manager", "fin"),
+    ("General manager", "gm"),
+    ("Board of director", "board"),
+]
 
 
 def _money(v):
@@ -21,61 +42,138 @@ def _money(v):
         return f"{Config.CURRENCY}{v}"
 
 
-def generate_po_pdf(po, items):
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        topMargin=18 * mm, bottomMargin=18 * mm,
-        leftMargin=16 * mm, rightMargin=16 * mm,
-        title=f"PO {po.get('po_no')}",
-    )
-    styles = getSampleStyleSheet()
-    h_company = ParagraphStyle("company", parent=styles["Title"], textColor=TEAL, fontSize=20, spaceAfter=2)
-    h_sub = ParagraphStyle("sub", parent=styles["Normal"], textColor=ORANGE, fontSize=10, spaceAfter=10)
-    normal = styles["Normal"]
-    right = ParagraphStyle("right", parent=normal, alignment=2)
-    foot = ParagraphStyle("foot", parent=normal, fontSize=8, textColor=colors.grey)
+def _is_urgent(po):
+    return str(po.get("urgent", "")).strip().lower() in ("yes", "true", "1")
 
-    urgent = str(po.get("urgent", "")).strip().lower() in ("yes", "true", "1")
 
-    elems = [
-        Paragraph(Config.COMPANY_NAME, h_company),
-        Paragraph("Purchase Order", h_sub),
-    ]
+def _approval_rows(po):
+    rows = []
+    stage = po.get("stage")
+    reject_stage = po.get("reject_stage")
+    reject_reason = po.get("reject_reason")
+    for label, code in STAGES:
+        by = str(po.get(f"{code}_by", "")).strip()
+        at = str(po.get(f"{code}_at", "")).strip()
+        if by:
+            verb = "Booked" if code == "book" else "Approved"
+            status = f"{verb} by {by}" + (f"  -  {at}" if at else "")
+        elif reject_stage == code and reject_reason:
+            status = f"Rejected: {reject_reason}"
+        elif stage == code:
+            status = ">> Awaiting"
+        elif _is_urgent(po) and code in ("gm", "board"):
+            status = "Notified only (no approval)"
+        else:
+            status = "Pending"
+        rows.append((label, status))
+    return rows
 
-    meta = [
-        [Paragraph(f"<b>PO No.</b>  {po.get('po_no')}", normal),
-         Paragraph(f"<b>Date</b>  {po.get('created_at', '')}", right)],
-        [Paragraph(f"<b>Requester</b>  {po.get('requester_name', '')}", normal),
-         Paragraph(f"<b>Urgent</b>  {'Yes' if urgent else 'No'}", right)],
-        [Paragraph(f"<b>Supplier</b>  {po.get('supplier', '')}", normal), Paragraph("", right)],
-    ]
-    mt = Table(meta, colWidths=[95 * mm, 75 * mm])
-    mt.setStyle(TableStyle([("BOTTOMPADDING", (0, 0), (-1, -1), 4), ("TOPPADDING", (0, 0), (-1, -1), 2)]))
-    elems += [mt, Spacer(1, 8 * mm)]
 
-    data = [["No", "Item", "Pack", "Qty", "Unit price", "Total"]]
-    for i, it in enumerate(items, 1):
-        data.append([str(i), it["item"], it.get("pack", ""), str(it["qty"]),
-                     _money(it["unit_price"]), _money(it["line_total"])])
-    data.append(["", "", "", "", "Total", _money(po.get("total", 0))])
+def generate_po_pdf(po, items, supplier_copy=False):
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(16, 16, 16)
+    pdf.set_auto_page_break(True, margin=16)
+    pdf.add_font(FONT, "", FONT_PATH)
+    pdf.add_font(FONT, "B", FONT_BOLD_PATH)
+    headings = FontFace(fill_color=TEAL, color=WHITE)
+    bold = FontFace(emphasis="BOLD")
 
-    tbl = Table(data, colWidths=[10 * mm, 70 * mm, 24 * mm, 13 * mm, 27 * mm, 26 * mm], repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), TEAL),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
-        ("ALIGN", (0, 0), (0, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID", (0, 0), (-1, -2), 0.5, GREY),
-        ("LINEABOVE", (0, -1), (-1, -1), 0.75, TEAL),
-        ("FONTNAME", (-2, -1), (-1, -1), "Helvetica-Bold"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    elems += [tbl, Spacer(1, 14 * mm), Paragraph("Generated by CML PO Bot", foot)]
+    def header(subtitle, sub_color):
+        pdf.set_font(FONT, "", 20)
+        pdf.set_text_color(*TEAL)
+        pdf.cell(0, 10, Config.COMPANY_NAME, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(FONT, "", 11)
+        pdf.set_text_color(*sub_color)
+        pdf.cell(0, 7, subtitle, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
 
-    doc.build(elems)
-    buf.seek(0)
-    return buf
+    def meta(label, value):
+        pdf.set_font(FONT, "", 11)
+        pdf.set_text_color(*GREY)
+        pdf.cell(34, 7, label, new_x="RIGHT", new_y="TOP")
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(0, 7, str(value), new_x="LMARGIN", new_y="NEXT")
+
+    def footer(note=""):
+        pdf.ln(8)
+        pdf.set_font(FONT, "", 8)
+        pdf.set_text_color(150, 150, 150)
+        txt = "Generated by CML PO Bot" + (f"   -   {note}" if note else "")
+        pdf.cell(0, 5, txt, new_x="LMARGIN", new_y="NEXT")
+
+    # ---------- PAGE 1: the order (supplier-facing) ----------
+    pdf.add_page()
+    pdf.set_text_shaping(True)
+    header("Purchase Order", ORANGE)
+    meta("PO No.", po.get("po_no"))
+    meta("Date", po.get("created_at", ""))
+    meta("Supplier", po.get("supplier", ""))
+    if str(po.get("category", "")).strip():
+        meta("Category", po.get("category", ""))
+    meta("Requester", po.get("requester_name", ""))
+    meta("Urgent", "Yes" if _is_urgent(po) else "No")
+    pdf.ln(4)
+
+    with pdf.table(
+        width=178,
+        col_widths=(9, 22, 59, 20, 11, 28, 29),
+        text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT", "RIGHT"),
+        headings_style=headings,
+        line_height=7,
+        first_row_as_headings=True,
+    ) as table:
+        head = table.row()
+        for h in ["No", "Code", "Item", "Pack", "Qty", "Unit price", "Total"]:
+            head.cell(h)
+        for i, it in enumerate(items, 1):
+            r = table.row()
+            r.cell(str(i))
+            r.cell(str(it.get("material_code", "")))
+            r.cell(str(it.get("item", "")))
+            r.cell(str(it.get("pack", "")))
+            r.cell(str(it.get("qty", "")))
+            r.cell(_money(it.get("unit_price", 0)))
+            r.cell(_money(it.get("line_total", 0)))
+        tot = table.row()
+        for _ in range(5):
+            tot.cell("")
+        tot.cell("Total", style=bold)
+        tot.cell(_money(po.get("total", 0)), style=bold)
+
+    if supplier_copy:
+        footer("Supplier copy")
+        return BytesIO(bytes(pdf.output()))
+
+    # ---------- PAGE 2: approval (internal) ----------
+    pdf.add_page()
+    header("Purchase Order Approval", TEAL)
+    meta("PO No.", po.get("po_no"))
+    meta("Supplier", po.get("supplier", ""))
+    meta("Date", po.get("created_at", ""))
+    meta("Current stage", STAGE_LABEL.get(po.get("stage"), po.get("stage", "")))
+    if str(po.get("reason", "")).strip():
+        pdf.set_font(FONT, "", 11)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 7, "Reason:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(0, 6, str(po.get("reason", "")), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    with pdf.table(
+        width=178,
+        col_widths=(52, 126),
+        text_align=("LEFT", "LEFT"),
+        headings_style=headings,
+        line_height=7,
+        first_row_as_headings=True,
+    ) as table:
+        head = table.row()
+        head.cell("Stage")
+        head.cell("Status")
+        for label, status in _approval_rows(po):
+            r = table.row()
+            r.cell(label)
+            r.cell(status)
+
+    footer()
+    return BytesIO(bytes(pdf.output()))

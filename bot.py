@@ -1,6 +1,8 @@
 """CML Purchase Order approval bot (Telegram + Google Sheets)."""
 import asyncio
+import html
 import logging
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -17,6 +19,8 @@ from pdf import generate_po_pdf
 import flow
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("fontTools").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("po_bot")
 
 WELCOME = (
@@ -29,7 +33,7 @@ WELCOME = (
 
 
 def now_str():
-    return datetime.now(ZoneInfo(Config.TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    return datetime.now(ZoneInfo(Config.TIMEZONE)).strftime("%d-%b-%Y %H:%M")
 
 
 def fullname(user):
@@ -41,8 +45,16 @@ def fullname(user):
 
 def _draft(context):
     return context.user_data.setdefault(
-        "draft", {"items": [], "supplier": None, "urgent": None, "editing_po": None}
+        "draft", {"items": [], "supplier": None, "urgent": None, "reason": None, "editing_po": None}
     )
+
+
+def _html_caption(text):
+    """Captions cap at ~1024 chars; if over, strip tags and send as plain text."""
+    if len(text) <= 1024:
+        return text, ParseMode.HTML
+    plain = re.sub(r"<[^>]+>", "", text)
+    return plain[:1024], None
 
 
 # ===================== talking to a stage group =====================
@@ -64,13 +76,11 @@ async def post_stage(context, po_no):
             pass
         return
     text = flow.po_summary(po, items, header=f"\u27a1\ufe0f Awaiting: {flow.STAGE_LABEL[stage]}")
+    caption, parse = _html_caption(text)
     kb = flow.action_keyboard(stage, po_no)
-    if stage == flow.STAGE_BOOK:
-        pdf = await asyncio.to_thread(generate_po_pdf, po, items)
-        await context.bot.send_document(chat_id=chat_id, document=pdf,
-                                         filename=f"PO_{po_no}.pdf", caption=text, reply_markup=kb)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    pdf = await asyncio.to_thread(generate_po_pdf, po, items)
+    await context.bot.send_document(chat_id=chat_id, document=pdf, filename=f"PO_{po_no}_{stage}.pdf",
+                                    caption=caption, parse_mode=parse, reply_markup=kb)
 
 
 async def notify_fyi(context, po_no, stage):
@@ -80,7 +90,10 @@ async def notify_fyi(context, po_no, stage):
     po = await asyncio.to_thread(sheets.get_po, po_no)
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
     text = flow.po_summary(po, items, header="\U0001f514 FYI \u2014 urgent PO approved (no action needed)")
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    caption, parse = _html_caption(text)
+    pdf = await asyncio.to_thread(generate_po_pdf, po, items)
+    await context.bot.send_document(chat_id=chat_id, document=pdf, filename=f"PO_{po_no}_approved.pdf",
+                                    caption=caption, parse_mode=parse)
 
 
 async def finalize(context, po_no):
@@ -117,10 +130,31 @@ async def cmd_new(update, context):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please create POs in a private chat with me \u2014 send /new in DM.")
         return
-    context.user_data["draft"] = {"items": [], "supplier": None, "urgent": None, "editing_po": None}
+    context.user_data["draft"] = {"items": [], "supplier": None, "urgent": None,
+                                  "reason": None, "category": None, "editing_po": None}
+    context.user_data["state"] = None
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f9ea Laboratory consumption", callback_data="cat:lab")],
+        [InlineKeyboardButton("\U0001f4e6 Other", callback_data="cat:other")],
+    ])
+    await update.message.reply_text("New PO \u2014 choose the type:", reply_markup=kb)
+
+
+async def _cb_category(q, context, cat):
+    if cat not in flow.CATEGORY_LABEL:
+        return
+    draft = _draft(context)
+    draft["category"] = cat
     context.user_data["state"] = "item"
-    await update.message.reply_text("New PO. Send the *item name* (or part of it).",
-                                    parse_mode=ParseMode.MARKDOWN)
+    label = flow.CATEGORY_LABEL[cat]
+    if cat == "other":
+        await q.message.reply_text(
+            f"*{label}* PO. Send the item name \u2014 I'll suggest from your Other list, "
+            f"or you can add a new one.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await q.message.reply_text(
+            f"*{label}* PO. Send the *item name* (or part of it) to search the master list.",
+            parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_mypos(update, context):
@@ -194,6 +228,12 @@ async def on_text(update, context):
         await _handle_item_name(update, context)
     elif state == "qty":
         await _handle_quantity(update, context)
+    elif state == "other_price":
+        await _handle_other_price(update, context)
+    elif state == "other_supplier":
+        await _handle_other_supplier(update, context)
+    elif state == "reason":
+        await _handle_po_reason(update, context)
     elif state == "editqty":
         await _handle_edit_qty(update, context)
     else:
@@ -203,6 +243,9 @@ async def on_text(update, context):
 async def _handle_item_name(update, context):
     draft = _draft(context)
     name = update.message.text.strip()
+    if draft.get("category") == "other":
+        await _handle_other_item_name(update, context, name)
+        return
     item = await asyncio.to_thread(sheets.find_item, name)
     if item:
         if draft["supplier"] and item["supplier"] != draft["supplier"]:
@@ -222,6 +265,76 @@ async def _handle_item_name(update, context):
                                         reply_markup=InlineKeyboardMarkup(rows))
     else:
         await update.message.reply_text(f"No match for '{name}' in the master list. Try another name.")
+
+
+async def _handle_other_item_name(update, context, name):
+    draft = _draft(context)
+    item = await asyncio.to_thread(sheets.find_other_item, name)
+    if item:
+        if draft["supplier"] and item["supplier"] != draft["supplier"]:
+            await update.message.reply_text(
+                f"\u26a0\ufe0f This PO is for *{draft['supplier']}*, but {item['item']} is from "
+                f"*{item['supplier']}*. One supplier per PO.", parse_mode=ParseMode.MARKDOWN)
+            return
+        await _ask_quantity(update.message, context, item)
+        return
+    context.user_data["other_typed"] = name
+    suggestions = await asyncio.to_thread(sheets.suggest_other_items, name)
+    rows = []
+    if suggestions:
+        context.user_data["suggestions"] = suggestions
+        rows = [[InlineKeyboardButton(s["item"], callback_data=f"pk:{i}")] for i, s in enumerate(suggestions)]
+    rows.append([InlineKeyboardButton(f"\u2795 Add \u201c{name[:28]}\u201d as new", callback_data="onew")])
+    rows.append([InlineKeyboardButton("\u2716\ufe0f Cancel", callback_data="cancel")])
+    msg = (f"'{name}' isn't in the Other list yet. Pick a match or add it:"
+           if suggestions else f"'{name}' isn't in the Other list yet. Add it as a new item?")
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _cb_other_new(q, context):
+    name = context.user_data.get("other_typed")
+    if not name:
+        context.user_data["state"] = "item"
+        await q.message.reply_text("Send the item name.")
+        return
+    context.user_data["state"] = "other_price"
+    await q.message.reply_text(f"Adding \u201c{name}\u201d. Send its *unit price* (number).",
+                               parse_mode=ParseMode.MARKDOWN)
+
+
+async def _handle_other_price(update, context):
+    try:
+        price = float(update.message.text.strip().replace("$", "").replace(",", ""))
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Send a valid price, e.g. 18.50")
+        return
+    context.user_data["other_price_val"] = round(price, 2)
+    context.user_data["state"] = "other_supplier"
+    name = context.user_data.get("other_typed", "this item")
+    await update.message.reply_text(f"Supplier for \u201c{name}\u201d?")
+
+
+async def _handle_other_supplier(update, context):
+    draft = _draft(context)
+    supplier = update.message.text.strip()
+    if not supplier:
+        await update.message.reply_text("Send the supplier name.")
+        return
+    if draft["supplier"] and supplier != draft["supplier"]:
+        await update.message.reply_text(
+            f"\u26a0\ufe0f This PO is for *{draft['supplier']}*. Use the same supplier, "
+            f"or start a new PO.", parse_mode=ParseMode.MARKDOWN)
+        return
+    name = context.user_data.get("other_typed", "")
+    price = context.user_data.get("other_price_val", 0.0)
+    item = {"item": name, "unit_price": price, "supplier": supplier,
+            "material_code": "", "supplier_reagent": "", "pack": ""}
+    await asyncio.to_thread(sheets.add_other_item, name, price, supplier)
+    context.user_data.pop("other_typed", None)
+    context.user_data.pop("other_price_val", None)
+    await _ask_quantity(update.message, context, item)
 
 
 async def _handle_quantity(update, context):
@@ -250,6 +363,16 @@ async def _handle_quantity(update, context):
     context.user_data["state"] = None
     context.user_data.pop("pending_item", None)
     await _show_items(update.message, context, prefix="\u2705 Added.")
+
+
+async def _handle_po_reason(update, context):
+    reason = update.message.text.strip()
+    if not reason:
+        await update.message.reply_text("Please type a short reason / purpose for this PO.")
+        return
+    _draft(context)["reason"] = reason
+    context.user_data["state"] = None
+    await _ask_urgent(update.message)
 
 
 async def _handle_edit_qty(update, context):
@@ -282,7 +405,11 @@ async def on_callback(update, context):
     q = update.callback_query
     data = q.data or ""
     await q.answer()
-    if data.startswith("pk:"):
+    if data.startswith("cat:"):
+        await _cb_category(q, context, data.split(":")[1])
+    elif data == "onew":
+        await _cb_other_new(q, context)
+    elif data.startswith("pk:"):
         await _cb_pick(q, context, int(data.split(":")[1]))
     elif data == "addmore":
         context.user_data["state"] = "item"
@@ -324,19 +451,28 @@ async def _cb_submit(q, context):
     if not _draft(context)["items"]:
         await q.message.reply_text("Add at least one item first.")
         return
+    context.user_data["state"] = "reason"
+    await q.message.reply_text("What is the reason / purpose for this PO? Reply with a short note.")
+
+
+async def _ask_urgent(target):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("\u26a1 Urgent", callback_data="u:1"),
         InlineKeyboardButton("Not urgent", callback_data="u:0"),
     ]])
-    await q.message.reply_text("Is this PO urgent?", reply_markup=kb)
+    await target.reply_text("Is this PO urgent?", reply_markup=kb)
 
 
 async def _cb_urgent(q, context, urgent):
     draft = _draft(context)
     draft["urgent"] = urgent
     lines = ["Please confirm:", "",
+             f"Category: {flow.CATEGORY_LABEL.get(draft.get('category'), '')}",
              f"Supplier: {draft['supplier']}",
-             f"Urgent: {'Yes' if urgent else 'No'}", ""]
+             f"Urgent: {'Yes' if urgent else 'No'}"]
+    if draft.get("reason"):
+        lines.append(f"Reason: {draft['reason']}")
+    lines.append("")
     for i, it in enumerate(draft["items"], 1):
         s = f"{i}. {it['item']} \u00d7{it['qty']}"
         if it.get("pack"):
@@ -365,6 +501,8 @@ async def _cb_confirm(q, context):
         "requester_id": user.id, "requester_name": fullname(user),
         "supplier": draft["supplier"], "total": total,
         "urgent": "yes" if draft["urgent"] else "no",
+        "reason": draft.get("reason", ""),
+        "category": flow.CATEGORY_LABEL.get(draft.get("category"), ""),
         "stage": flow.STAGE_STOCK, "status": "active", "updated_at": now_str(),
     }
     await asyncio.to_thread(sheets.create_po, po)
@@ -382,7 +520,10 @@ async def _cb_edit_open(q, context, po_no):
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
     context.user_data["draft"] = {
         "items": [dict(it) for it in items],
-        "supplier": po["supplier"], "urgent": flow.is_urgent(po), "editing_po": po_no,
+        "supplier": po["supplier"], "urgent": flow.is_urgent(po),
+        "reason": po.get("reason", ""),
+        "category": flow.CATEGORY_CODE.get(str(po.get("category", "")).strip(), "lab"),
+        "editing_po": po_no,
     }
     context.user_data["state"] = None
     await _show_items(q.message, context,
@@ -413,7 +554,8 @@ async def _cb_resubmit(q, context):
     await asyncio.to_thread(sheets.replace_line_items, po_no, draft["items"])
     await asyncio.to_thread(
         sheets.update_po, po_no, supplier=draft["supplier"], total=total,
-        urgent="yes" if draft["urgent"] else "no", stage=flow.STAGE_STOCK, status="active",
+        urgent="yes" if draft["urgent"] else "no", reason=draft.get("reason", ""),
+        stage=flow.STAGE_STOCK, status="active",
         reject_stage="", reject_reason="", updated_at=now_str())
     context.user_data.clear()
     await q.message.reply_text(f"\U0001f501 PO #{po_no} resubmitted. Back to the Stock controller.")
@@ -421,12 +563,14 @@ async def _cb_resubmit(q, context):
 
 
 async def _ack_edit(q, suffix):
-    base = q.message.caption if q.message.caption is not None else (q.message.text or "")
+    msg = q.message
     try:
-        if q.message.caption is not None:
-            await q.edit_message_caption(caption=base + suffix)
+        if msg.caption is not None:
+            base = msg.caption_html if msg.caption_html is not None else (msg.caption or "")
+            await q.edit_message_caption(caption=base + suffix, parse_mode=ParseMode.HTML)
         else:
-            await q.edit_message_text(text=base + suffix)
+            base = msg.text_html if msg.text_html is not None else (msg.text or "")
+            await q.edit_message_text(text=base + suffix, parse_mode=ParseMode.HTML)
     except Exception:
         try:
             await q.edit_message_reply_markup(reply_markup=None)
@@ -460,8 +604,12 @@ async def _cb_action(q, context, data):
         by_col, at_col = flow.STAGE_AUDIT[stage]
         await asyncio.to_thread(sheets.update_po, po_no,
                                 **{by_col: fullname(user), at_col: now_str(), "updated_at": now_str()})
-        verb = "Booked" if act == "booked" else "Approved"
-        await _ack_edit(q, f"\n\n\u2705 {verb} by {fullname(user)} \u00b7 {now_str()}")
+        bits = [f"\u2705 {flow.action_verb(stage)} by {html.escape(fullname(user))}"]
+        pos = flow.position(stage)
+        if pos:
+            bits.append(pos)
+        bits.append(now_str())
+        await _ack_edit(q, "\n\n" + "  |  ".join(bits))
         nxt = flow.next_stage(stage, flow.is_urgent(po))
         if nxt == flow.STAGE_APPROVED:
             await finalize(context, po_no)
