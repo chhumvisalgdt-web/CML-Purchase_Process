@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -679,6 +679,17 @@ async def _maybe_capture_reason(update, context):
 
 
 # ===================== bootstrap =====================
+async def _on_error(update, context):
+    err = context.error
+    if isinstance(err, Conflict):
+        log.error("Conflict: another instance is polling this SAME bot token. Run only ONE "
+                  "instance/replica, and don't share this token with your other bot.")
+    elif isinstance(err, (TimedOut, NetworkError)):
+        log.warning("Network issue talking to Telegram: %s", err)
+    else:
+        log.error("Unhandled error: %s", err, exc_info=err)
+
+
 def build_app():
     request = HTTPXRequest(connection_pool_size=16, read_timeout=60,
                            write_timeout=60, connect_timeout=20, pool_timeout=30)
@@ -690,6 +701,7 @@ def build_app():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(_on_error)
     return app
 
 
@@ -702,7 +714,7 @@ def main():
     ensure_fonts()
     app = build_app()
     log.info("Bot starting (polling) in timezone %s", Config.TIMEZONE)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
