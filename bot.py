@@ -15,7 +15,7 @@ from telegram.ext import (
 
 from config import Config
 from sheets import sheets
-from pdf import generate_po_pdf
+from pdf import generate_po_pdf, ensure_fonts
 import flow
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -676,6 +676,7 @@ def main():
         raise SystemExit("Missing required env vars: " + ", ".join(missing))
     email = sheets.ensure_tabs()
     log.info("Sheets ready. Make sure the spreadsheet is shared (Editor) with: %s", email)
+    ensure_fonts()
     app = build_app()
     log.info("Bot starting (polling) in timezone %s", Config.TIMEZONE)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

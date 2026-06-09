@@ -4,7 +4,9 @@ Page 1 = the order (supplier-facing copy). Page 2 = internal approval trail.
 Pass supplier_copy=True to produce page 1 only (a clean copy for the supplier).
 Uses the bundled Battambang font (Khmer + Latin) so Khmer names render correctly.
 """
+import logging
 import os
+import urllib.request
 from io import BytesIO
 
 from fpdf import FPDF
@@ -15,6 +17,28 @@ from config import Config
 FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang.ttf")
 FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang-Bold.ttf")
 FONT = "Battambang"
+
+# Fallback download (Google Fonts) if the fonts weren't committed to the repo.
+_FONT_BASE = "https://raw.githubusercontent.com/google/fonts/main/ofl/battambang"
+FONT_URLS = {
+    FONT_PATH: f"{_FONT_BASE}/Battambang-Regular.ttf",
+    FONT_BOLD_PATH: f"{_FONT_BASE}/Battambang-Bold.ttf",
+}
+
+
+def ensure_fonts():
+    """Download the bundled fonts if missing (so deployment doesn't require uploading them)."""
+    try:
+        os.makedirs(os.path.dirname(FONT_PATH), exist_ok=True)
+    except Exception:
+        pass
+    for path, url in FONT_URLS.items():
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) < 1000:
+                logging.getLogger("po_bot").info("Fetching font %s", os.path.basename(path))
+                urllib.request.urlretrieve(url, path)
+        except Exception as e:
+            logging.getLogger("po_bot").warning("Could not fetch font %s: %s", os.path.basename(path), e)
 
 TEAL = (24, 123, 133)
 ORANGE = (198, 125, 31)
@@ -70,6 +94,7 @@ def _approval_rows(po):
 
 
 def generate_po_pdf(po, items, supplier_copy=False):
+    ensure_fonts()
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_margins(16, 16, 16)
     pdf.set_auto_page_break(True, margin=16)
