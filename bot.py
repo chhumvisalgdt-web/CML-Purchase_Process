@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
@@ -58,6 +60,27 @@ def _html_caption(text):
 
 
 # ===================== talking to a stage group =====================
+async def _send_pdf(context, chat_id, pdf, filename, caption, parse, reply_markup=None):
+    """Send a PDF with generous timeouts, retrying transient network/timeout errors.
+
+    Uploading a document over a slow link can exceed the default timeout; without
+    a retry the PO would advance but its card would never reach the group.
+    """
+    data = pdf.getvalue() if hasattr(pdf, "getvalue") else pdf
+    last = None
+    for attempt in range(4):
+        try:
+            return await context.bot.send_document(
+                chat_id=chat_id, document=data, filename=filename,
+                caption=caption, parse_mode=parse, reply_markup=reply_markup,
+                read_timeout=60, write_timeout=60, connect_timeout=20, pool_timeout=30)
+        except (TimedOut, NetworkError) as e:
+            last = e
+            log.warning("send_document to %s failed (attempt %d/4): %s", chat_id, attempt + 1, e)
+            await asyncio.sleep(2 * (attempt + 1))
+    raise last
+
+
 async def post_stage(context, po_no):
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if not po:
@@ -79,8 +102,7 @@ async def post_stage(context, po_no):
     caption, parse = _html_caption(text)
     kb = flow.action_keyboard(stage, po_no)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items)
-    await context.bot.send_document(chat_id=chat_id, document=pdf, filename=f"PO_{po_no}_{stage}.pdf",
-                                    caption=caption, parse_mode=parse, reply_markup=kb)
+    await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{stage}.pdf", caption, parse, kb)
 
 
 async def notify_fyi(context, po_no, stage):
@@ -92,8 +114,7 @@ async def notify_fyi(context, po_no, stage):
     text = flow.po_summary(po, items, header="\U0001f514 FYI \u2014 urgent PO approved (no action needed)")
     caption, parse = _html_caption(text)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items)
-    await context.bot.send_document(chat_id=chat_id, document=pdf, filename=f"PO_{po_no}_approved.pdf",
-                                    caption=caption, parse_mode=parse)
+    await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_approved.pdf", caption, parse)
 
 
 async def finalize(context, po_no):
@@ -659,7 +680,9 @@ async def _maybe_capture_reason(update, context):
 
 # ===================== bootstrap =====================
 def build_app():
-    app = Application.builder().token(Config.BOT_TOKEN).build()
+    request = HTTPXRequest(connection_pool_size=16, read_timeout=60,
+                           write_timeout=60, connect_timeout=20, pool_timeout=30)
+    app = Application.builder().token(Config.BOT_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("mypos", cmd_mypos))
