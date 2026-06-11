@@ -105,16 +105,17 @@ async def post_stage(context, po_no):
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{stage}.pdf", caption, parse, kb)
 
 
-async def notify_fyi(context, po_no, stage):
-    chat_id = Config.CHAT_IDS.get(stage)
+async def notify_group(context, po_no, chat_key, header):
+    """Post a PO card (no buttons) to a group for information only."""
+    chat_id = Config.CHAT_IDS.get(chat_key)
     if not chat_id:
         return
     po = await asyncio.to_thread(sheets.get_po, po_no)
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
-    text = flow.po_summary(po, items, header="\U0001f514 FYI \u2014 urgent PO approved (no action needed)")
+    text = flow.po_summary(po, items, header=header)
     caption, parse = _html_caption(text)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items)
-    await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_approved.pdf", caption, parse)
+    await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{chat_key}.pdf", caption, parse)
 
 
 async def finalize(context, po_no):
@@ -122,8 +123,12 @@ async def finalize(context, po_no):
                             status="approved", updated_at=now_str())
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if flow.is_urgent(po):
-        await notify_fyi(context, po_no, flow.STAGE_GM)
-        await notify_fyi(context, po_no, flow.STAGE_BOARD)
+        fyi = "\U0001f514 FYI \u2014 urgent PO approved (no action needed)"
+        await notify_group(context, po_no, flow.STAGE_GM, fyi)
+        await notify_group(context, po_no, flow.STAGE_BOARD, fyi)
+    await notify_group(context, po_no, "approved", "\u2705 Approved (for your records)")
+    if str(po.get("payment_type", "")).strip() == flow.PAYMENT_LABEL["ca"]:
+        await notify_group(context, po_no, "cash", "\U0001f4b5 Cash Advance \u2014 approved")
     try:
         await context.bot.send_message(chat_id=int(po["requester_id"]),
                                         text=f"\U0001f389 PO #{po_no} is fully approved.")
@@ -621,14 +626,19 @@ async def _cb_action(q, context, data):
             pass
         return
 
-    if act in ("ok", "booked"):
+    if act in ("ok", "booked", "ca", "ap"):
         by_col, at_col = flow.STAGE_AUDIT[stage]
-        await asyncio.to_thread(sheets.update_po, po_no,
-                                **{by_col: fullname(user), at_col: now_str(), "updated_at": now_str()})
+        fields = {by_col: fullname(user), at_col: now_str(), "updated_at": now_str()}
+        pay = flow.PAYMENT_LABEL.get(act) if stage == flow.STAGE_FIN else None
+        if pay:
+            fields["payment_type"] = pay
+        await asyncio.to_thread(sheets.update_po, po_no, **fields)
         bits = [f"\u2705 {flow.action_verb(stage)} by {html.escape(fullname(user))}"]
         pos = flow.position(stage)
         if pos:
             bits.append(pos)
+        if pay:
+            bits.append(pay)
         bits.append(now_str())
         await _ack_edit(q, "\n\n" + "  |  ".join(bits))
         nxt = flow.next_stage(stage, flow.is_urgent(po))

@@ -44,6 +44,8 @@ class Config:
         "fin": _to_int(os.environ.get("FINANCE_CHAT_ID")),
         "gm": _to_int(os.environ.get("GM_CHAT_ID")),
         "board": _to_int(os.environ.get("BOARD_CHAT_ID")),
+        "approved": _to_int(os.environ.get("APPROVED_PO_CHAT_ID")),
+        "cash": _to_int(os.environ.get("CASH_ADVANCE_CHAT_ID")),
     }
 
     # ---- Optional approver locks (comma-separated user IDs; empty = anyone in the group) ----

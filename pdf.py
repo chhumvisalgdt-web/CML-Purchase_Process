@@ -79,7 +79,7 @@ def _approval_rows(po):
         by = str(po.get(f"{code}_by", "")).strip()
         at = str(po.get(f"{code}_at", "")).strip()
         if by:
-            verb = "Booked" if code == "book" else "Approved"
+            verb = {"stock": "Checked", "book": "Booked"}.get(code, "Approved")
             status = f"{verb} by {by}" + (f"  -  {at}" if at else "")
         elif reject_stage == code and reject_reason:
             status = f"Rejected: {reject_reason}"
@@ -135,8 +135,6 @@ def generate_po_pdf(po, items, supplier_copy=False):
     meta("Supplier", po.get("supplier", ""))
     if str(po.get("category", "")).strip():
         meta("Category", po.get("category", ""))
-    meta("Requester", po.get("requester_name", ""))
-    meta("Urgent", "Yes" if _is_urgent(po) else "No")
     pdf.ln(4)
 
     with pdf.table(
@@ -175,6 +173,9 @@ def generate_po_pdf(po, items, supplier_copy=False):
     meta("PO No.", po.get("po_no"))
     meta("Supplier", po.get("supplier", ""))
     meta("Date", po.get("created_at", ""))
+    meta("Urgent", "Yes" if _is_urgent(po) else "No")
+    if str(po.get("payment_type", "")).strip():
+        meta("Payment", po.get("payment_type", ""))
     meta("Current stage", STAGE_LABEL.get(po.get("stage"), po.get("stage", "")))
     if str(po.get("reason", "")).strip():
         pdf.set_font(FONT, "", 11)
@@ -195,6 +196,10 @@ def generate_po_pdf(po, items, supplier_copy=False):
         head = table.row()
         head.cell("Stage")
         head.cell("Status")
+        rr = table.row()
+        rr.cell("Requester")
+        _created = str(po.get("created_at", "")).strip()
+        rr.cell(str(po.get("requester_name", "")) + (f"  -  {_created}" if _created else ""))
         for label, status in _approval_rows(po):
             r = table.row()
             r.cell(label)

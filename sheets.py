@@ -25,7 +25,7 @@ PO_HEADERS = [
     "total", "urgent", "stage", "status",
     "stock_by", "stock_at", "book_by", "book_at", "fin_by", "fin_at",
     "gm_by", "gm_at", "board_by", "board_at",
-    "reject_stage", "reject_reason", "updated_at", "reason", "category",
+    "reject_stage", "reject_reason", "updated_at", "reason", "category", "payment_type",
 ]
 LINE_HEADERS = ["po_no", "line_id", "material_code", "item", "supplier_reagent", "pack",
                 "qty", "unit_price", "line_total"]
