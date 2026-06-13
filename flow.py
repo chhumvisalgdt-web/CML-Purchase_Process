@@ -105,19 +105,49 @@ def money(value):
         return f"{Config.CURRENCY}{value}"
 
 
-def _item_line(it):
+def price_drift(it):
+    """Return (ref, unit, pct, flagged) when this line's price differs from its reference,
+    else None. pct is None when the reference price is 0 (no percentage possible).
+    flagged=True when the change is at/above Config.OTHER_PRICE_TOLERANCE_PCT."""
+    try:
+        unit = float(it.get("unit_price", 0))
+        ref = float(it.get("ref_price"))
+    except (TypeError, ValueError):
+        return None
+    if abs(unit - ref) <= 0.005:
+        return None
+    pct = ((unit - ref) / ref * 100.0) if ref > 0 else None
+    flagged = (pct is None) or (abs(pct) >= Config.OTHER_PRICE_TOLERANCE_PCT)
+    return ref, unit, pct, flagged
+
+
+def _item_line(it, show_prices=True):
     name = html.escape(str(it.get("item", "")))
     pack = f" ({html.escape(str(it['pack']))})" if it.get("pack") else ""
-    return (f"- {name} \u00d7{it.get('qty', 0)}{pack} "
-            f"@ {money(it.get('unit_price', 0))} = {money(it.get('line_total', 0))}")
+    if not show_prices:
+        return f"- {name} \u00d7{it.get('qty', 0)}{pack}"
+    s = (f"- {name} \u00d7{it.get('qty', 0)}{pack} "
+         f"@ {money(it.get('unit_price', 0))} = {money(it.get('line_total', 0))}")
+    d = price_drift(it)
+    if d:
+        ref, _unit, pct, flagged = d
+        if flagged:
+            pct_txt = f" ({pct:+.0f}%)" if pct is not None else ""
+            s += f"\n   \u26a0\ufe0f price changed: was {money(ref)}{pct_txt}"
+        else:
+            s += f" (was {money(ref)})"
+    vr = str(it.get("variant_reason", "")).strip()
+    if vr:
+        s += f"\n   \U0001f4dd supplier choice: {html.escape(vr)}"
+    return s
 
 
-def po_summary(po, items, header=None):
-    """HTML-formatted summary posted to the approver groups."""
+def po_summary(po, items, header=None, show_prices=True):
+    """HTML-formatted summary posted to the approver groups.
+    show_prices=False produces a price-blind card (used for the Stock controller)."""
     e = html.escape
     supplier = e(str(po.get("supplier", "")))
     requester = e(str(po.get("requester_name", "")))
-    total = money(po.get("total", 0))
 
     head = f"PO #{po['po_no']}"
     category = str(po.get("category", "")).strip()
@@ -133,6 +163,7 @@ def po_summary(po, items, header=None):
     if ptype:
         line2 += f"  |  {e(ptype)}"
     lines = [head, line2, ""]
-    lines += [_item_line(it) for it in items]
-    lines.append(f"<b>Total: {total}</b>")
+    lines += [_item_line(it, show_prices) for it in items]
+    if show_prices:
+        lines.append(f"<b>Total: {money(po.get('total', 0))}</b>")
     return "\n".join(lines)

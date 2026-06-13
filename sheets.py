@@ -6,6 +6,7 @@
   (No. / Material Code / CML Reagent / Supplier / Supplier Reagent / Price / Pack) works as-is.
 """
 import json
+import re
 import time
 import difflib
 
@@ -28,9 +29,10 @@ PO_HEADERS = [
     "reject_stage", "reject_reason", "updated_at", "reason", "category", "payment_type",
 ]
 LINE_HEADERS = ["po_no", "line_id", "material_code", "item", "supplier_reagent", "pack",
-                "qty", "unit_price", "line_total"]
-# Reusable reference list for the "Other" category (bot reads and appends to it)
-OTHER_HEADERS = ["item", "unit_price", "supplier"]
+                "qty", "unit_price", "line_total", "ref_price", "variant_reason"]
+# Reusable reference list for the "Other" category (bot reads and appends to it).
+# unit_price is the current reference price; updated_at/updated_by record its last change.
+OTHER_HEADERS = ["item", "unit_price", "supplier", "updated_at", "updated_by"]
 
 
 def _to_float(v):
@@ -45,6 +47,12 @@ def _to_float(v):
 
 def _norm(h):
     return str(h).strip().lower().rstrip(".").strip()
+
+
+def norm_supplier(s):
+    """Normalize a supplier name for duplicate detection: casefold, keep letters/digits only.
+    'ABC Co.' / 'abc co' / 'ABC-CO' all become 'abcco'."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).casefold())
 
 
 class Sheets:
@@ -157,21 +165,30 @@ class Sheets:
         self._master_cache, self._master_cache_at = out, time.time()
         return out
 
-    def find_item(self, name):
+    def find_items(self, name):
+        """All master rows whose item name matches exactly — one per supplier/pack variant.
+        The same CML reagent can be listed under several suppliers; return every variant."""
         name_l = name.strip().lower()
-        for m in self.get_master():
-            if m["item"].lower() == name_l:
-                return m
-        return None
+        return [m for m in self.get_master() if m["item"].lower() == name_l]
+
+    def find_item(self, name):
+        matches = self.find_items(name)
+        return matches[0] if matches else None
 
     def suggest_items(self, name, n=3):
+        """Suggest distinct item NAMES (duplicates across suppliers collapsed consistently
+        to the first occurrence; the caller re-resolves variants via find_items on pick)."""
         master = self.get_master()
-        names = [m["item"] for m in master]
+        by_name, names = {}, []
+        for m in master:
+            key = m["item"].lower()
+            if key not in by_name:
+                by_name[key] = m
+                names.append(m["item"])
         matches = difflib.get_close_matches(name, names, n=n, cutoff=0.4)
         subs = [x for x in names if name.strip().lower() in x.lower() and x not in matches]
         chosen = (matches + subs)[:n]
-        by_name = {m["item"]: m for m in master}
-        return [by_name[x] for x in chosen]
+        return [by_name[x.lower()] for x in chosen]
 
     # ---- "Other" reusable list ----
     def get_other_master(self, force=False):
@@ -187,6 +204,8 @@ class Sheets:
                 "item": name,
                 "unit_price": _to_float(r.get("unit_price")),
                 "supplier": str(r.get("supplier", "")).strip(),
+                "updated_at": str(r.get("updated_at", "")).strip(),
+                "updated_by": str(r.get("updated_by", "")).strip(),
                 "material_code": "", "supplier_reagent": "", "pack": "",
             })
         self._other_cache, self._other_cache_at = out, time.time()
@@ -208,12 +227,51 @@ class Sheets:
         by_name = {m["item"]: m for m in master}
         return [by_name[x] for x in chosen]
 
-    def add_other_item(self, item, unit_price, supplier):
+    def add_other_item(self, item, unit_price, supplier, by="", at=""):
         if self.find_other_item(item):
             return
         ws = self._ws("Other_Items", OTHER_HEADERS)
-        ws.append_row([item, unit_price, supplier], value_input_option="USER_ENTERED")
+        ws.append_row([item, unit_price, supplier, at, by], value_input_option="USER_ENTERED")
         self._other_cache = None
+
+    def update_other_item_price(self, item, unit_price, by="", at=""):
+        """Set a new reference price for an existing Other item (no-op if unchanged).
+        Per-PO prices remain in Line_Items, so this keeps no history of its own."""
+        ws = self._ws("Other_Items", OTHER_HEADERS)
+        name_l = str(item).strip().lower()
+        col = ws.col_values(1)
+        for rownum, v in enumerate(col, start=1):
+            if rownum == 1:
+                continue
+            if str(v).strip().lower() == name_l:
+                cur = _to_float(ws.cell(rownum, OTHER_HEADERS.index("unit_price") + 1).value)
+                if abs(cur - float(unit_price)) <= 0.005:
+                    return False
+                ws.update_cell(rownum, OTHER_HEADERS.index("unit_price") + 1, unit_price)
+                ws.update_cell(rownum, OTHER_HEADERS.index("updated_at") + 1, at)
+                ws.update_cell(rownum, OTHER_HEADERS.index("updated_by") + 1, by)
+                self._other_cache = None
+                return True
+        return False
+
+    def other_suppliers(self):
+        """Distinct suppliers from the Other list, most recently added first."""
+        seen, out = set(), []
+        for m in reversed(self.get_other_master()):
+            s = m["supplier"]
+            if s and norm_supplier(s) not in seen:
+                seen.add(norm_supplier(s))
+                out.append(s)
+        return out
+
+    def all_known_suppliers(self):
+        """Distinct suppliers across the Other list and the master list (original casing)."""
+        seen, out = set(), []
+        for s in self.other_suppliers() + [m["supplier"] for m in self.get_master()]:
+            if s and norm_supplier(s) not in seen:
+                seen.add(norm_supplier(s))
+                out.append(s)
+        return out
 
     # ---- PO numbering ----
     def next_po_no(self):
@@ -268,7 +326,8 @@ class Sheets:
         ws = self._ws("Line_Items", LINE_HEADERS)
         rows = [[po_no, f"{po_no}-{i}", it.get("material_code", ""), it["item"],
                  it.get("supplier_reagent", ""), it.get("pack", ""),
-                 it["qty"], it["unit_price"], it["line_total"]]
+                 it["qty"], it["unit_price"], it["line_total"],
+                 it.get("ref_price", it["unit_price"]), it.get("variant_reason", "")]
                 for i, it in enumerate(items, 1)]
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
@@ -278,6 +337,8 @@ class Sheets:
         out = []
         for r in ws.get_all_records(expected_headers=LINE_HEADERS):
             if str(r.get("po_no")).strip() == str(po_no):
+                unit = _to_float(r.get("unit_price"))
+                ref_raw = str(r.get("ref_price", "")).strip()
                 out.append({
                     "line_id": str(r.get("line_id", "")),
                     "material_code": str(r.get("material_code", "")),
@@ -285,8 +346,10 @@ class Sheets:
                     "supplier_reagent": str(r.get("supplier_reagent", "")),
                     "pack": str(r.get("pack", "")),
                     "qty": int(_to_float(r.get("qty"))),
-                    "unit_price": _to_float(r.get("unit_price")),
+                    "unit_price": unit,
                     "line_total": _to_float(r.get("line_total")),
+                    "ref_price": _to_float(ref_raw) if ref_raw else unit,
+                    "variant_reason": str(r.get("variant_reason", "")).strip(),
                 })
         return out
 

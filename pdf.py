@@ -13,6 +13,7 @@ from fpdf import FPDF
 from fpdf.fonts import FontFace
 
 from config import Config
+import flow as _flow
 
 FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang.ttf")
 FONT_BOLD_PATH = os.path.join(os.path.dirname(__file__), "fonts", "Battambang-Bold.ttf")
@@ -93,7 +94,10 @@ def _approval_rows(po):
     return rows
 
 
-def generate_po_pdf(po, items, supplier_copy=False):
+def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
+    """show_prices=False renders a price-blind PDF (No/Code/Item/Pack/Qty only, no totals,
+    no drift note) — used for the Stock controller stage. The supplier copy always
+    includes prices (it is the order document)."""
     ensure_fonts()
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_margins(16, 16, 16)
@@ -137,31 +141,51 @@ def generate_po_pdf(po, items, supplier_copy=False):
         meta("Category", po.get("category", ""))
     pdf.ln(4)
 
-    with pdf.table(
-        width=178,
-        col_widths=(9, 22, 59, 20, 11, 28, 29),
-        text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT", "RIGHT"),
-        headings_style=headings,
-        line_height=7,
-        first_row_as_headings=True,
-    ) as table:
-        head = table.row()
-        for h in ["No", "Code", "Item", "Pack", "Qty", "Unit price", "Total"]:
-            head.cell(h)
-        for i, it in enumerate(items, 1):
-            r = table.row()
-            r.cell(str(i))
-            r.cell(str(it.get("material_code", "")))
-            r.cell(str(it.get("item", "")))
-            r.cell(str(it.get("pack", "")))
-            r.cell(str(it.get("qty", "")))
-            r.cell(_money(it.get("unit_price", 0)))
-            r.cell(_money(it.get("line_total", 0)))
-        tot = table.row()
-        for _ in range(5):
-            tot.cell("")
-        tot.cell("Total", style=bold)
-        tot.cell(_money(po.get("total", 0)), style=bold)
+    if show_prices:
+        with pdf.table(
+            width=178,
+            col_widths=(9, 22, 59, 20, 11, 28, 29),
+            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT", "RIGHT"),
+            headings_style=headings,
+            line_height=7,
+            first_row_as_headings=True,
+        ) as table:
+            head = table.row()
+            for h in ["No", "Code", "Item", "Pack", "Qty", "Unit price", "Total"]:
+                head.cell(h)
+            for i, it in enumerate(items, 1):
+                r = table.row()
+                r.cell(str(i))
+                r.cell(str(it.get("material_code", "")))
+                r.cell(str(it.get("item", "")))
+                r.cell(str(it.get("pack", "")))
+                r.cell(str(it.get("qty", "")))
+                r.cell(_money(it.get("unit_price", 0)))
+                r.cell(_money(it.get("line_total", 0)))
+            tot = table.row()
+            for _ in range(5):
+                tot.cell("")
+            tot.cell("Total", style=bold)
+            tot.cell(_money(po.get("total", 0)), style=bold)
+    else:
+        with pdf.table(
+            width=178,
+            col_widths=(12, 30, 86, 30, 20),
+            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT"),
+            headings_style=headings,
+            line_height=7,
+            first_row_as_headings=True,
+        ) as table:
+            head = table.row()
+            for h in ["No", "Code", "Item", "Pack", "Qty"]:
+                head.cell(h)
+            for i, it in enumerate(items, 1):
+                r = table.row()
+                r.cell(str(i))
+                r.cell(str(it.get("material_code", "")))
+                r.cell(str(it.get("item", "")))
+                r.cell(str(it.get("pack", "")))
+                r.cell(str(it.get("qty", "")))
 
     if supplier_copy:
         footer("Supplier copy")
@@ -183,6 +207,43 @@ def generate_po_pdf(po, items, supplier_copy=False):
         pdf.cell(0, 7, "Reason:", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         pdf.multi_cell(0, 6, str(po.get("reason", "")), new_x="LMARGIN", new_y="NEXT")
+
+    # Flag reference-price changes for approvers (internal page only, never the supplier copy,
+    # and not on the price-blind Stock controller copy).
+    drift_notes = []
+    if show_prices:
+        for it in items:
+            d = _flow.price_drift(it)
+            if d and d[3]:  # flagged (at/above tolerance)
+                ref, unit, pct, _ = d
+                note = f"{it.get('item', '')}: {_money(ref)} -> {_money(unit)}"
+                if pct is not None:
+                    note += f" ({pct:+.0f}%)"
+                drift_notes.append(note)
+    if drift_notes:
+        pdf.ln(2)
+        pdf.set_font(FONT, "", 11)
+        pdf.set_text_color(*ORANGE)
+        pdf.cell(0, 7, "Price changed vs reference list "
+                       f"(tolerance +/-{Config.OTHER_PRICE_TOLERANCE_PCT:.0f}%):",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        for note in drift_notes:
+            pdf.multi_cell(0, 6, "  -  " + note, new_x="LMARGIN", new_y="NEXT")
+
+    # Requester's justification when a pricier supplier was chosen over a cheaper variant.
+    if show_prices:
+        sel_notes = [f"{it.get('item', '')}: {str(it.get('variant_reason', '')).strip()}"
+                     for it in items if str(it.get("variant_reason", "")).strip()]
+        if sel_notes:
+            pdf.ln(2)
+            pdf.set_font(FONT, "", 11)
+            pdf.set_text_color(*ORANGE)
+            pdf.cell(0, 7, "Supplier selection (a cheaper variant existed):",
+                     new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+            for note in sel_notes:
+                pdf.multi_cell(0, 6, "  -  " + note, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     with pdf.table(

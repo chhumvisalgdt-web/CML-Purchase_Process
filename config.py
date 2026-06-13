@@ -9,6 +9,13 @@ def _to_int(value):
         return None
 
 
+def _to_float(value, default):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _id_list(value):
     if not value:
         return []
@@ -36,6 +43,9 @@ class Config:
     START_PO_NO = _to_int(os.environ.get("START_PO_NO")) or 1
     CURRENCY = os.environ.get("CURRENCY", "$")
     COMPANY_NAME = os.environ.get("COMPANY_NAME", "CAMMED LAB")
+    # "Other" category: if a reused item's new price differs from the reference by at least
+    # this percentage, the requester must confirm and approvers see a warning flag.
+    OTHER_PRICE_TOLERANCE_PCT = _to_float(os.environ.get("OTHER_PRICE_TOLERANCE_PCT"), 20.0)
 
     # ---- One group chat ID per stage ----
     CHAT_IDS = {
