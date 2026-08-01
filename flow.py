@@ -1,8 +1,14 @@
 """Stage order, transitions, keyboards, and the PO summary text (HTML-formatted)."""
 import html
+from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import Config
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 STAGE_STOCK = "stock"
 STAGE_BOOK = "book"
@@ -10,6 +16,8 @@ STAGE_FIN = "fin"
 STAGE_GM = "gm"
 STAGE_BOARD = "board"
 STAGE_APPROVED = "approved"
+STAGE_RECEIVING = "receiving"
+STAGE_CLOSED = "closed"
 STAGE_RETURNED = "returned"
 
 STAGE_LABEL = {
@@ -19,6 +27,8 @@ STAGE_LABEL = {
     "gm": "General manager",
     "board": "Board of director",
     "approved": "Approved",
+    "receiving": "Awaiting delivery",
+    "closed": "Closed",
     "returned": "Returned to requester",
 }
 
@@ -45,6 +55,53 @@ CATEGORY_CODE = {v.lower(): k for k, v in CATEGORY_LABEL.items()}
 PAYMENT_LABEL = {"ca": "Cash Advance", "ap": "Account Payable"}
 
 
+def local_now():
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(Config.TIMEZONE)).replace(tzinfo=None)
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def is_working_time(dt):
+    return (dt.weekday() in Config.WORK_DAYS
+            and Config.WORK_START_HOUR <= dt.hour < Config.WORK_END_HOUR)
+
+
+def next_working_moment(dt=None):
+    """When this order can actually go to the supplier.
+
+    Inside working hours that is now. Outside them -- evenings, Sundays -- the
+    order is recorded for the next working day's opening, because nobody is
+    there to send it and dating it 'now' would overstate how promptly it went
+    out. Public holidays are NOT handled: Cambodia has many, and the bot has no
+    calendar for them, so a holiday will still be treated as a working day.
+    """
+    dt = dt or local_now()
+    if is_working_time(dt):
+        return dt, True
+    cur = dt
+    if dt.weekday() in Config.WORK_DAYS and dt.hour < Config.WORK_START_HOUR:
+        return dt.replace(hour=Config.WORK_START_HOUR, minute=0, second=0,
+                          microsecond=0), False
+    for _ in range(8):
+        cur = (cur + timedelta(days=1)).replace(
+            hour=Config.WORK_START_HOUR, minute=0, second=0, microsecond=0)
+        if cur.weekday() in Config.WORK_DAYS:
+            return cur, False
+    return dt, False
+
+
+def order_due_text(dt=None):
+    when, now = next_working_moment(dt)
+    if now:
+        return when.strftime("%d-%b-%Y %H:%M"), "send today"
+    return (when.strftime("%d-%b-%Y %H:%M"),
+            f"outside working hours \u2014 send {when:%a %d-%b} from "
+            f"{Config.WORK_START_HOUR:02d}:00")
+
+
 def is_urgent(po):
     return str(po.get("urgent", "")).strip().lower() in ("yes", "true", "1")
 
@@ -58,7 +115,9 @@ def position(stage):
 
 
 def next_stage(stage, urgent):
-    """Return the next stage. Urgent skips GM/Board approval (they are only notified)."""
+    """Approval is no longer terminal: an approved PO goes on to be ordered,
+    received, and only then closed. Urgent still skips GM/Board APPROVAL --
+    they are notified -- but never skips receiving."""
     if stage == STAGE_STOCK:
         return STAGE_BOOK
     if stage == STAGE_BOOK:
@@ -69,7 +128,17 @@ def next_stage(stage, urgent):
         return STAGE_BOARD
     if stage == STAGE_BOARD:
         return STAGE_APPROVED
-    return STAGE_APPROVED
+    if stage == STAGE_APPROVED:
+        return STAGE_RECEIVING
+    if stage == STAGE_RECEIVING:
+        return STAGE_CLOSED
+    return STAGE_CLOSED
+
+
+# Stages that hold an approval decision. Receiving is execution, not approval:
+# it cannot reject a PO back to the requester, only report a discrepancy, so it
+# is deliberately absent here.
+APPROVAL_STAGES = (STAGE_STOCK, STAGE_BOOK, STAGE_FIN, STAGE_GM, STAGE_BOARD)
 
 
 def positive_action(stage):
@@ -85,6 +154,24 @@ def positive_label(stage):
 
 
 def action_keyboard(stage, po_no):
+    if stage == STAGE_BOOK:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f4b2 Confirm / update prices",
+                                  callback_data=f"bk:price:{po_no}")],
+            [InlineKeyboardButton("\u2705 Booked",
+                                  callback_data=f"a:book:booked:{po_no}"),
+             InlineKeyboardButton("\u274c Reject",
+                                  callback_data=f"a:book:no:{po_no}")],
+        ])
+    if stage == STAGE_STOCK:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f4ca Enter stock on hand",
+                                  callback_data=f"sc:ask:{po_no}")],
+            [InlineKeyboardButton("\u2705 Checked",
+                                  callback_data=f"a:stock:ok:{po_no}"),
+             InlineKeyboardButton("\u274c Reject",
+                                  callback_data=f"a:stock:no:{po_no}")],
+        ])
     if stage == STAGE_FIN:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("\u2705 Approve \u00b7 Cash Advance", callback_data=f"a:fin:ca:{po_no}")],

@@ -28,9 +28,14 @@ PO_HEADERS = [
     "gm_by", "gm_at", "board_by", "board_at",
     "reject_stage", "reject_reason", "updated_at", "reason", "category", "payment_type",
     "upload_id", "supplier_reason",
+    "price_confirmed_by", "price_confirmed_at",
+    "approved_at", "order_due", "order_due_note",
+    "received_status", "closed_at", "closed_reason",
 ]
-LINE_HEADERS = ["po_no", "line_id", "material_code", "item", "supplier_reagent", "pack",
-                "qty", "unit_price", "line_total", "ref_price", "variant_reason"]
+LINE_HEADERS = ["po_no", "line_id", "material_code", "supplier_code", "item",
+                "supplier_reagent", "pack", "qty", "unit_price", "line_total",
+                "ref_price", "variant_reason", "on_hand",
+                "cancelled_qty", "cancelled_by", "cancelled_at", "cancel_reason"]
 # Frozen record of the old free-entry "Other" list. The bot no longer reads or
 # writes it -- "Other" items now live in Config.OTHER_MASTER_TAB with a code,
 # a supplier and a price, exactly like reagents. Kept only so past POs remain
@@ -55,6 +60,22 @@ UPLOAD_HEADERS = [
 UPLOAD_ROW_HEADERS = [
     "upload_id", "row_no", "raw_code", "raw_qty", "raw_note", "status",
     "message", "matched_code", "matched_item", "matched_supplier", "matched_pack",
+]
+
+# ---- goods receipt ----
+# Append-only, one row per line PER LOT per delivery. A correction is a
+# negative row with a reason, never an edit: overwriting a quantity loses the
+# delivery history exactly when it is needed.
+RECEIPT_HEADERS = [
+    "receipt_id", "po_no", "line_id", "material_code", "item", "qty_received",
+    "invoice_qty", "lot_no", "expiry", "invoice_no", "invoice_date",
+    "received_by", "received_at", "note",
+]
+# Stock on hand recorded by the stock controller at the stock stage. Also
+# append-only -- a re-count is a new row, so the sequence stays readable.
+STOCK_COUNT_HEADERS = [
+    "po_no", "line_id", "material_code", "item", "on_hand", "ordered",
+    "counted_by", "counted_at",
 ]
 
 
@@ -87,6 +108,8 @@ class Sheets:
         self._master_cache_at = 0.0
         self._other_cache = None
         self._other_cache_at = 0.0
+        self._ws_cache = {}       # tab name -> worksheet handle
+        self._po_rows = {}        # po_no -> row number
 
     # ---- clients ----
     def _client(self):
@@ -109,17 +132,39 @@ class Sheets:
             self._msh = self._client().open_by_key(mid)
         return self._msh
 
+    @staticmethod
+    def _ensure_capacity(ws, needed):
+        """A new tab holds 1000 rows and gspread's append fails once that is
+        used up. Receipts and Upload_Rows are the fast growers -- one row per
+        line per lot per delivery -- so grow the tab before writing rather than
+        discovering the ceiling on a live receipt."""
+        try:
+            used = len(ws.col_values(1))
+            spare = (ws.row_count or 0) - used
+            if spare < needed + 50:
+                ws.add_rows(max(1000, needed + 500))
+        except Exception:
+            pass
+
     def _ws(self, name, headers):
+        """Cached worksheet handle. The header check ran on EVERY call before,
+        which was roughly a third of the API traffic; once per process is
+        enough, since only the bot writes these tabs."""
+        ws = self._ws_cache.get(name)
+        if ws is not None:
+            return ws
         sh = self._open()
         try:
             ws = sh.worksheet(name)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=name, rows=200, cols=max(10, len(headers)))
+            ws = sh.add_worksheet(title=name, rows=2000, cols=max(10, len(headers)))
             ws.update(values=[headers], range_name="A1")
+            self._ws_cache[name] = ws
             return ws
         first = [h.strip().lower() for h in ws.row_values(1)]
         if first != headers:
             ws.update(values=[headers], range_name="A1")
+        self._ws_cache[name] = ws
         return ws
 
     def ensure_tabs(self):
@@ -127,6 +172,8 @@ class Sheets:
         self._ws("Line_Items", LINE_HEADERS)
         self._ws("Uploads", UPLOAD_HEADERS)
         self._ws("Upload_Rows", UPLOAD_ROW_HEADERS)
+        self._ws("Receipts", RECEIPT_HEADERS)
+        self._ws("Stock_Counts", STOCK_COUNT_HEADERS)
         # If the master list is meant to be in the main spreadsheet, make sure the tab exists.
         mid = Config.MASTER_SPREADSHEET_ID or Config.SPREADSHEET_ID
         if mid == Config.SPREADSHEET_ID:
@@ -255,20 +302,43 @@ class Sheets:
     # ---- PO rows ----
     def create_po(self, po):
         ws = self._ws("POs", PO_HEADERS)
-        ws.append_row([po.get(h, "") for h in PO_HEADERS], value_input_option="USER_ENTERED")
+        self._ensure_capacity(ws, 1)
+        res = ws.append_row([po.get(h, "") for h in PO_HEADERS],
+                            value_input_option="USER_ENTERED")
+        try:
+            rng = res["updates"]["updatedRange"].split("!")[1]
+            self._po_rows[str(po.get("po_no"))] = int(
+                "".join(ch for ch in rng.split(":")[0] if ch.isdigit()))
+        except Exception:
+            pass
 
     def _find_po_row(self, ws, po_no):
+        cached = self._po_rows.get(str(po_no))
+        if cached:
+            return cached
         for i, v in enumerate(ws.col_values(1), start=1):
             if str(v).strip() == str(po_no):
+                self._po_rows[str(po_no)] = i
                 return i
         return None
 
     def get_po(self, po_no):
+        """One column scan (usually cached) plus one row fetch. The old version
+        pulled the entire POs tab through get_all_records on every call, and
+        update_po then scanned column A a second time."""
         ws = self._ws("POs", PO_HEADERS)
-        for r in ws.get_all_records(expected_headers=PO_HEADERS):
-            if str(r.get("po_no")).strip() == str(po_no):
-                return {k: r.get(k, "") for k in PO_HEADERS}
-        return None
+        rownum = self._find_po_row(ws, po_no)
+        if not rownum:
+            return None
+        vals = ws.row_values(rownum)
+        if str(vals[0]).strip() != str(po_no):   # rows shifted underneath us
+            self._po_rows.pop(str(po_no), None)
+            rownum = self._find_po_row(ws, po_no)
+            if not rownum:
+                return None
+            vals = ws.row_values(rownum)
+        vals += [""] * (len(PO_HEADERS) - len(vals))
+        return {h: vals[i] for i, h in enumerate(PO_HEADERS)}
 
     def get_pos_by_requester(self, requester_id):
         ws = self._ws("POs", PO_HEADERS)
@@ -293,12 +363,16 @@ class Sheets:
     # ---- line items ----
     def add_line_items(self, po_no, items):
         ws = self._ws("Line_Items", LINE_HEADERS)
-        rows = [[po_no, f"{po_no}-{i}", it.get("material_code", ""), it["item"],
+        rows = [[po_no, f"{po_no}-{i}", it.get("material_code", ""),
+                 it.get("supplier_code", ""), it["item"],
                  it.get("supplier_reagent", ""), it.get("pack", ""),
                  it["qty"], it["unit_price"], it["line_total"],
-                 it.get("ref_price", it["unit_price"]), it.get("variant_reason", "")]
+                 it.get("ref_price", it["unit_price"]),
+                 it.get("variant_reason", ""), it.get("on_hand", ""),
+                 "", "", "", ""]
                 for i, it in enumerate(items, 1)]
         if rows:
+            self._ensure_capacity(ws, len(rows))
             ws.append_rows(rows, value_input_option="USER_ENTERED")
 
     def get_line_items(self, po_no):
@@ -311,6 +385,7 @@ class Sheets:
                 out.append({
                     "line_id": str(r.get("line_id", "")),
                     "material_code": str(r.get("material_code", "")),
+                    "supplier_code": str(r.get("supplier_code", "")),
                     "item": str(r.get("item", "")),
                     "supplier_reagent": str(r.get("supplier_reagent", "")),
                     "pack": str(r.get("pack", "")),
@@ -319,6 +394,9 @@ class Sheets:
                     "line_total": _to_float(r.get("line_total")),
                     "ref_price": _to_float(ref_raw) if ref_raw else unit,
                     "variant_reason": str(r.get("variant_reason", "")).strip(),
+                    "on_hand": str(r.get("on_hand", "")).strip(),
+                    "cancelled_qty": int(_to_float(r.get("cancelled_qty"))),
+                    "cancel_reason": str(r.get("cancel_reason", "")).strip(),
                 })
         return out
 
@@ -332,6 +410,122 @@ class Sheets:
         for rownum in reversed(doomed):
             ws.delete_rows(rownum)
         self.add_line_items(po_no, items)
+
+    # ---- goods receipt ----
+    def get_receipts(self, po_no):
+        """Query by PO rather than reading the whole tab. Receipts is the
+        fastest-growing tab (one row per line per lot per delivery) and sits on
+        the receiving hot path, so a full scan here ages badly."""
+        ws = self._ws("Receipts", RECEIPT_HEADERS)
+        try:
+            cells = ws.findall(str(po_no), in_column=2)
+        except Exception:
+            cells = []
+        out = []
+        for c in cells:
+            vals = ws.row_values(c.row)
+            vals += [""] * (len(RECEIPT_HEADERS) - len(vals))
+            r = {h: vals[i] for i, h in enumerate(RECEIPT_HEADERS)}
+            r["qty_received"] = int(_to_float(r.get("qty_received")))
+            out.append(r)
+        return out
+
+    def add_receipts(self, po_no, entries, invoice_no, invoice_date, by, at):
+        """One batched write per delivery, never one call per lot."""
+        ws = self._ws("Receipts", RECEIPT_HEADERS)
+        stamp = int(time.time() * 1000)
+        rows = [[f"R{stamp}-{i}", po_no, e.get("line_id", ""),
+                 e.get("code", ""), e.get("item", ""), e.get("qty_received", 0),
+                 e.get("invoice_qty", ""), e.get("lot_no", ""),
+                 e.get("expiry", ""), invoice_no, invoice_date, by, at,
+                 e.get("note", "")]
+                for i, e in enumerate(entries, 1)]
+        if rows:
+            self._ensure_capacity(ws, len(rows))
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows)
+
+    def add_stock_counts(self, po_no, counts, by, at):
+        ws = self._ws("Stock_Counts", STOCK_COUNT_HEADERS)
+        rows = [[po_no, c.get("line_id", ""), c.get("code", ""),
+                 c.get("item", ""), c.get("on_hand", ""), c.get("ordered", ""),
+                 by, at] for c in counts]
+        if rows:
+            self._ensure_capacity(ws, len(rows))
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows)
+
+    # ---- line-item updates (price confirmation, stock count, cancellation) ----
+    def _line_rows(self, po_no):
+        ws = self._ws("Line_Items", LINE_HEADERS)
+        return ws, [i for i, v in enumerate(ws.col_values(1), start=1)
+                    if i > 1 and str(v).strip() == str(po_no)]
+
+    def update_lines(self, po_no, by_line_id):
+        """by_line_id: {line_id: {column: value}}. One batch_update for the
+        whole PO rather than a call per cell."""
+        ws, rownums = self._line_rows(po_no)
+        if not rownums:
+            return 0
+        lid_col = LINE_HEADERS.index("line_id") + 1
+        reqs = []
+        for rownum in rownums:
+            lid = str(ws.cell(rownum, lid_col).value or "").strip()
+            fields = by_line_id.get(lid)
+            if not fields:
+                continue
+            for k, v in fields.items():
+                if k in LINE_HEADERS:
+                    reqs.append({
+                        "range": gspread.utils.rowcol_to_a1(
+                            rownum, LINE_HEADERS.index(k) + 1),
+                        "values": [[v]]})
+        if reqs:
+            ws.batch_update(reqs, value_input_option="USER_ENTERED")
+        return len(reqs)
+
+    def open_lines(self):
+        """Every line still outstanding across all active POs -- feeds the
+        monthly cancellation review."""
+        ws = self._ws("Line_Items", LINE_HEADERS)
+        pos = {p["po_no"]: p for p in self.active_pos()}
+        if not pos:
+            return []
+        got = {}
+        rws = self._ws("Receipts", RECEIPT_HEADERS)
+        for r in rws.get_all_records(expected_headers=RECEIPT_HEADERS):
+            if str(r.get("po_no")).strip() in pos:
+                lid = str(r.get("line_id", ""))
+                got[lid] = got.get(lid, 0) + int(_to_float(r.get("qty_received")))
+        out = []
+        for r in ws.get_all_records(expected_headers=LINE_HEADERS):
+            po_no = str(r.get("po_no")).strip()
+            if po_no not in pos:
+                continue
+            lid = str(r.get("line_id", ""))
+            ordered = int(_to_float(r.get("qty")))
+            cancelled = int(_to_float(r.get("cancelled_qty")))
+            received = got.get(lid, 0)
+            if received + cancelled >= ordered:
+                continue
+            out.append({
+                "po_no": po_no, "line_id": lid,
+                "material_code": str(r.get("material_code", "")),
+                "item": str(r.get("item", "")),
+                "supplier": pos[po_no].get("supplier", ""),
+                "created_at": pos[po_no].get("created_at", ""),
+                "stage": pos[po_no].get("stage", ""),
+                "ordered": ordered, "received": received,
+                "cancelled": cancelled,
+                "outstanding": ordered - received - cancelled,
+            })
+        return out
+
+    def active_pos(self):
+        ws = self._ws("POs", PO_HEADERS)
+        return [{k: r.get(k, "") for k in PO_HEADERS}
+                for r in ws.get_all_records(expected_headers=PO_HEADERS)
+                if str(r.get("status", "")).strip() == "active"]
 
     # ---- upload audit trail ----
     def log_upload_start(self, user, meta, supersedes=None):
@@ -348,6 +542,7 @@ class Sheets:
                   "populated_below_range", "template_version",
                   "template_supplier", "template_category"):
             row[k] = meta.get(k, "") or ""
+        self._ensure_capacity(ws, 1)
         ws.append_row([row.get(h, "") for h in UPLOAD_HEADERS],
                       value_input_option="USER_ENTERED")
         return upload_id
@@ -358,6 +553,7 @@ class Sheets:
         rows = [[upload_id] + [r.get(h, "") for h in UPLOAD_ROW_HEADERS[1:]]
                 for r in report]
         if rows:
+            self._ensure_capacity(ws, len(rows))
             ws.append_rows(rows, value_input_option="USER_ENTERED")
 
     def log_upload_result(self, upload_id, result, summary=None, po_no=""):

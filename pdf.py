@@ -57,6 +57,7 @@ STAGES = [
     ("Finance manager", "fin"),
     ("General manager", "gm"),
     ("Board of director", "board"),
+    ("Ordering", "ordering"),
 ]
 
 
@@ -80,7 +81,8 @@ def _approval_rows(po):
         by = str(po.get(f"{code}_by", "")).strip()
         at = str(po.get(f"{code}_at", "")).strip()
         if by:
-            verb = {"stock": "Checked", "book": "Booked"}.get(code, "Approved")
+            verb = {"stock": "Checked", "book": "Booked",
+                    "ordering": "Ordered"}.get(code, "Approved")
             status = f"{verb} by {by}" + (f"  -  {at}" if at else "")
         elif reject_stage == code and reject_reason:
             status = f"Rejected: {reject_reason}"
@@ -96,7 +98,7 @@ def _approval_rows(po):
 
 def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
     """show_prices=False renders a price-blind PDF (No/Code/Item/Pack/Qty only, no totals,
-    no drift note) — used for the Stock controller stage. The supplier copy always
+    no price-change note) — used for the Stock controller stage. The supplier copy always
     includes prices (it is the order document)."""
     ensure_fonts()
     pdf = FPDF(orientation="P", unit="mm", format="A4")
@@ -141,23 +143,27 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
         meta("Category", po.get("category", ""))
     pdf.ln(4)
 
-    if show_prices:
+    if supplier_copy:
+        # The supplier's own code and their own item name. The internal CML
+        # code means nothing to them -- and their code is not always unique
+        # (two products can share one), so the name disambiguates the line.
         with pdf.table(
             width=178,
-            col_widths=(9, 22, 59, 20, 11, 28, 29),
+            col_widths=(9, 30, 68, 20, 11, 20, 20),
             text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT", "RIGHT"),
             headings_style=headings,
             line_height=7,
             first_row_as_headings=True,
         ) as table:
             head = table.row()
-            for h in ["No", "Code", "Item", "Pack", "Qty", "Unit price", "Total"]:
+            for h in ["No", "Supplier code", "Item", "Pack", "Qty",
+                      "Unit price", "Total"]:
                 head.cell(h)
             for i, it in enumerate(items, 1):
                 r = table.row()
                 r.cell(str(i))
-                r.cell(str(it.get("material_code", "")))
-                r.cell(str(it.get("item", "")))
+                r.cell(str(it.get("supplier_code", "")))
+                r.cell(str(it.get("supplier_reagent") or it.get("item", "")))
                 r.cell(str(it.get("pack", "")))
                 r.cell(str(it.get("qty", "")))
                 r.cell(_money(it.get("unit_price", 0)))
@@ -167,17 +173,69 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 tot.cell("")
             tot.cell("Total", style=bold)
             tot.cell(_money(po.get("total", 0)), style=bold)
-    else:
+        footer("Supplier copy")
+        return BytesIO(bytes(pdf.output()))
+
+    if show_prices:
         with pdf.table(
             width=178,
-            col_widths=(12, 30, 86, 30, 20),
-            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT"),
+            col_widths=(8, 30, 22, 38, 14, 9, 28, 29),
+            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "LEFT", "RIGHT",
+                        "RIGHT", "RIGHT"),
             headings_style=headings,
             line_height=7,
             first_row_as_headings=True,
         ) as table:
             head = table.row()
-            for h in ["No", "Code", "Item", "Pack", "Qty"]:
+            for h in ["No", "CML code", "Supplier code", "Item", "Pack", "Qty",
+                      "Unit price", "Total"]:
+                head.cell(h)
+            for i, it in enumerate(items, 1):
+                r = table.row()
+                r.cell(str(i))
+                r.cell(str(it.get("material_code", "")))
+                r.cell(str(it.get("supplier_code", "")))
+                r.cell(str(it.get("item", "")))
+                r.cell(str(it.get("pack", "")))
+                r.cell(str(it.get("qty", "")))
+                # The change belongs next to the price, not only in the note on
+                # page 2 -- an approver reading the order table should not have
+                # to turn the page to see that the price moved.
+                d = _flow.price_drift(it)
+                price = _money(it.get("unit_price", 0))
+                if d:
+                    ref, _u, pct, flagged = d
+                    price += (f"\n(was {_money(ref)}"
+                              + (f", {pct:+.0f}%" if pct is not None else "")
+                              + (" <<" if flagged else "") + ")")
+                r.cell(price)
+                r.cell(_money(it.get("line_total", 0)))
+            tot = table.row()
+            for _ in range(6):
+                tot.cell("")
+            tot.cell("Total", style=bold)
+            tot.cell(_money(po.get("total", 0)), style=bold)
+        if any(_flow.price_drift(it) for it in items):
+            pdf.ln(2)
+            pdf.set_font(FONT, "", 9)
+            pdf.set_text_color(*ORANGE)
+            pdf.cell(0, 5,
+                     "Prices marked (was ...) were confirmed with the supplier "
+                     "and differ from the master list;  <<  marks a change of "
+                     f"+/-{Config.OTHER_PRICE_TOLERANCE_PCT:.0f}% or more.",
+                     new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+    else:
+        with pdf.table(
+            width=178,
+            col_widths=(12, 28, 74, 26, 18, 20),
+            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT"),
+            headings_style=headings,
+            line_height=7,
+            first_row_as_headings=True,
+        ) as table:
+            head = table.row()
+            for h in ["No", "Code", "Item", "Pack", "Qty", "On hand"]:
                 head.cell(h)
             for i, it in enumerate(items, 1):
                 r = table.row()
@@ -186,10 +244,7 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 r.cell(str(it.get("item", "")))
                 r.cell(str(it.get("pack", "")))
                 r.cell(str(it.get("qty", "")))
-
-    if supplier_copy:
-        footer("Supplier copy")
-        return BytesIO(bytes(pdf.output()))
+                r.cell(str(it.get("on_hand", "") or "-"))
 
     # ---------- PAGE 2: approval (internal) ----------
     pdf.add_page()
@@ -201,6 +256,8 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
     if str(po.get("payment_type", "")).strip():
         meta("Payment", po.get("payment_type", ""))
     meta("Current stage", STAGE_LABEL.get(po.get("stage"), po.get("stage", "")))
+    if str(po.get("order_due", "")).strip():
+        meta("Send to supplier", po.get("order_due", ""))
     if str(po.get("reason", "")).strip():
         pdf.set_font(FONT, "", 11)
         pdf.set_text_color(*GREY)
@@ -210,27 +267,6 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
 
     # Flag reference-price changes for approvers (internal page only, never the supplier copy,
     # and not on the price-blind Stock controller copy).
-    drift_notes = []
-    if show_prices:
-        for it in items:
-            d = _flow.price_drift(it)
-            if d and d[3]:  # flagged (at/above tolerance)
-                ref, unit, pct, _ = d
-                note = f"{it.get('item', '')}: {_money(ref)} -> {_money(unit)}"
-                if pct is not None:
-                    note += f" ({pct:+.0f}%)"
-                drift_notes.append(note)
-    if drift_notes:
-        pdf.ln(2)
-        pdf.set_font(FONT, "", 11)
-        pdf.set_text_color(*ORANGE)
-        pdf.cell(0, 7, "Price changed vs reference list "
-                       f"(tolerance +/-{Config.OTHER_PRICE_TOLERANCE_PCT:.0f}%):",
-                 new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(0, 0, 0)
-        for note in drift_notes:
-            pdf.multi_cell(0, 6, "  -  " + note, new_x="LMARGIN", new_y="NEXT")
-
     # Requester's justification for the supplier chosen for the whole PO. The
     # supplier is picked once, before any item is seen, so this is PO-level.
     if show_prices and str(po.get("supplier_reason", "")).strip():

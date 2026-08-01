@@ -43,6 +43,12 @@ class Config:
 
     # ---- Behaviour ----
     TIMEZONE = os.environ.get("TIMEZONE", "Asia/Phnom_Penh")
+    # Working hours used to decide when an approved order is actually sendable.
+    # WORK_DAYS is Mon=0 .. Sun=6; the default is Mon-Sat.
+    WORK_DAYS = [int(d) for d in
+                 os.environ.get("WORK_DAYS", "0,1,2,3,4,5").split(",") if d.strip()]
+    WORK_START_HOUR = _to_int(os.environ.get("WORK_START_HOUR")) or 8
+    WORK_END_HOUR = _to_int(os.environ.get("WORK_END_HOUR")) or 17
     START_PO_NO = _to_int(os.environ.get("START_PO_NO")) or 1
     CURRENCY = os.environ.get("CURRENCY", "$")
     COMPANY_NAME = os.environ.get("COMPANY_NAME", "CAMMED LAB")

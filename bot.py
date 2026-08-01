@@ -20,6 +20,8 @@ from sheets import sheets
 from pdf import generate_po_pdf, ensure_fonts
 import flow
 import upload_handlers
+import post_handlers
+import group_handlers
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("fontTools").setLevel(logging.WARNING)
@@ -125,16 +127,20 @@ async def notify_group(context, po_no, chat_key, header, show_prices=True):
 
 
 async def finalize(context, po_no):
+    # An order approved after hours cannot actually be sent until the next
+    # working morning; recording it as "now" would overstate how promptly it
+    # went out.
+    due, due_note = flow.order_due_text()
     await asyncio.to_thread(sheets.update_po, po_no, stage=flow.STAGE_APPROVED,
-                            status="approved", updated_at=now_str())
+                            status="approved", approved_at=now_str(),
+                            order_due=due, order_due_note=due_note,
+                            updated_at=now_str())
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if flow.is_urgent(po):
         fyi = "\U0001f514 FYI \u2014 urgent PO approved (no action needed)"
         await notify_group(context, po_no, flow.STAGE_GM, fyi)
         await notify_group(context, po_no, flow.STAGE_BOARD, fyi)
-    # Approved POs group is a broad audience — keep it price-free.
-    await notify_group(context, po_no, "approved", "\u2705 Approved (for your records)",
-                       show_prices=False)
+    await _post_approved(context, po_no, po)
     if str(po.get("payment_type", "")).strip() == flow.PAYMENT_LABEL["ca"]:
         await notify_group(context, po_no, "cash", "\U0001f4b5 Cash Advance \u2014 approved")
     try:
@@ -142,6 +148,44 @@ async def finalize(context, po_no):
                                         text=f"\U0001f389 PO #{po_no} is fully approved.")
     except Exception as e:
         log.warning("Could not DM requester on approval: %s", e)
+
+
+async def _post_approved(context, po_no, po):
+    """Two clearly-named PDFs, so nobody has to work out which one is safe to
+    forward. The order carries the supplier's own codes and item names and no
+    approval trail; the approval copy is the same order plus the sign-offs and
+    is internal only."""
+    chat_id = Config.CHAT_IDS.get("approved")
+    if not chat_id:
+        log.error("No approved-PO chat id configured (PO %s)", po_no)
+        return
+    items = await asyncio.to_thread(sheets.get_line_items, po_no)
+    missing = _missing_supplier_codes(items)
+
+    header = "\u2705 Approved \u2014 forward the order PDF to the supplier"
+    text = flow.po_summary(po, items, header=header)
+    note = str(po.get("order_due_note", "")).strip()
+    if note == "send today":
+        text += "\n\n\U0001f4e4 Send to the supplier today."
+    elif note:
+        text += f"\n\n\U0001f552 {note}."
+    if missing:
+        text += (f"\n\n\u26a0\ufe0f {len(missing)} line(s) have no supplier "
+                 f"code; they are identified by the supplier's item name only.")
+    caption, parse = _html_caption(text)
+
+    order = await asyncio.to_thread(generate_po_pdf, po, items,
+                                    supplier_copy=True)
+    await _send_pdf(context, chat_id, order, f"PO_{po_no}.pdf", caption, parse)
+
+    approval = await asyncio.to_thread(generate_po_pdf, po, items)
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id, document=approval,
+            filename=f"PO_{po_no}_approval.pdf",
+            caption="Approval copy \u2014 internal. Do not forward.")
+    except Exception as e:
+        log.warning("Could not send approval copy for PO %s: %s", po_no, e)
 
 
 # ===================== commands =====================
@@ -499,9 +543,19 @@ async def _cb_action(q, context, data):
         return
 
     if act in ("ok", "booked", "ca", "ap"):
+        if stage == flow.STAGE_STOCK:
+            items = await asyncio.to_thread(sheets.get_line_items, po_no)
+            if any(not str(it.get("on_hand", "")).strip() for it in items):
+                await q.answer(
+                    "Enter the stock on hand first \u2014 tap "
+                    "'Enter stock on hand'.", show_alert=True)
+                return
         await q.answer()
-        by_col, at_col = flow.STAGE_AUDIT[stage]
-        fields = {by_col: fullname(user), at_col: now_str(), "updated_at": now_str()}
+        by_col, at_col = flow.STAGE_AUDIT.get(stage, ("", ""))
+        fields = {"updated_at": now_str()}
+        if by_col:
+            fields[by_col] = fullname(user)
+            fields[at_col] = now_str()
         pay = flow.PAYMENT_LABEL.get(act) if stage == flow.STAGE_FIN else None
         if pay:
             fields["payment_type"] = pay
@@ -517,9 +571,23 @@ async def _cb_action(q, context, data):
         nxt = flow.next_stage(stage, flow.is_urgent(po))
         if nxt == flow.STAGE_APPROVED:
             await finalize(context, po_no)
+            # Approval is no longer terminal: the PO waits for delivery. There
+            # is no ordering gate -- the approved-PO group forwards the order
+            # PDF to the supplier by hand.
+            await asyncio.to_thread(sheets.update_po, po_no,
+                                    stage=flow.STAGE_RECEIVING,
+                                    received_status="awaiting",
+                                    updated_at=now_str())
+            await _tell_stock_to_receive(context, po_no)
         else:
             await asyncio.to_thread(sheets.update_po, po_no, stage=nxt, updated_at=now_str())
             await post_stage(context, po_no)
+        if stage in (flow.STAGE_GM, flow.STAGE_BOARD):
+            await _tell_finance(
+                context,
+                f"\u2705 PO #{po_no} \u00b7 {po.get('supplier', '')} approved by "
+                f"{flow.STAGE_LABEL[stage]} ({fullname(user)}).\n"
+                f"Now at: {flow.STAGE_LABEL.get(nxt, nxt)}.")
     elif act == "no":
         await q.answer()
         context.chat_data["await_reason"] = {
@@ -528,6 +596,30 @@ async def _cb_action(q, context, data):
         await q.message.reply_text(
             f"{fullname(user)}, *reply to this message* with the reason for rejecting PO #{po_no}.",
             parse_mode=ParseMode.MARKDOWN)
+
+
+async def _tell_finance(context, text):
+    cid = Config.CHAT_IDS.get("fin")
+    if not cid:
+        return
+    try:
+        await context.bot.send_message(chat_id=cid, text=text)
+    except Exception as e:
+        log.warning("Could not notify finance: %s", e)
+
+
+async def _tell_stock_to_receive(context, po_no):
+    cid = Config.CHAT_IDS.get("stock")
+    if not cid:
+        return
+    po = await asyncio.to_thread(sheets.get_po, po_no)
+    try:
+        await context.bot.send_message(
+            chat_id=cid,
+            text=(f"\U0001f4e6 PO #{po_no} \u00b7 {po.get('supplier', '')} has "
+                  f"been ordered.\nWhen it arrives, send /receive {po_no}."))
+    except Exception as e:
+        log.warning("Could not notify stock group: %s", e)
 
 
 async def _maybe_capture_reason(update, context):
@@ -588,7 +680,10 @@ def build_app():
     # The upload router must come BEFORE the generic one, or every "up:" tap is
     # swallowed with no error and nothing in the logs.
     upload_handlers.register(app, {"ask_reason": _ask_reason})
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(?!up:)"))
+    post_handlers.register(app)
+    group_handlers.register(app)
+    app.add_handler(CallbackQueryHandler(
+        on_callback, pattern=r"^(?!up:|sc:|bk:price:|rc:|cx:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(_on_error)
     return app

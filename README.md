@@ -12,6 +12,58 @@ A Telegram bot that runs the CML purchase-order approval flow and stores everyth
    - **Not urgent** → General manager → Board of director → Approved.
    - **Urgent** → approved straight after Finance; GM and Board are notified only.
 6. Approved POs are posted to the **Approved POs** group (price-free), and additionally to the **Cash Advance** group when Finance chose that route.
+7. **Approved POs group** — receives two PDFs and forwards the order to the supplier.
+8. **Receiving** (stock controller group) — `/receive <po>` produces a file of the not-yet-received lines. Quantities are entered per line **per lot**, with lot number, expiry and the supplier's invoice number.
+9. The PO **closes** once every line is fully received or cancelled.
+
+Approval is no longer terminal — a PO waits for delivery before it closes. Urgent POs still skip GM/Board *approval*, but never skip receiving.
+
+## The two approved PDFs
+
+| File | Contents | Forward? |
+|---|---|---|
+| `PO_<no>.pdf` | Supplier code, the supplier's own item name, pack, qty, price, total | **Yes** — this is the order |
+| `PO_<no>_approval.pdf` | The same order plus every sign-off, the stock count, price changes and justifications | **No** — internal |
+
+Sending both, clearly named, removes the risk that someone forwards the internal file and the supplier sees your approval trail, your reference prices and your rejection reasons. Verified: the order copy contains no CML code, no approval trail and no reference price.
+
+There is no ordering gate — nobody taps "Ordered". The trade-off is that `ordered_at` is not captured, so the system cannot tell "ordered, not yet delivered" from "nobody sent it", and supplier lead time is not measurable.
+
+## Post-approval stages
+
+### Stock count (stage 1)
+The stock controller must enter units on hand before passing the PO on — `📊 Enter stock on hand` sends a small Excel file. `#N/A` is a permitted answer where a count is not possible, and it never coerces to 0: zero means "none in stock", which is the strongest possible argument *for* the order. Counts land in `Stock_Counts` (append-only) and appear on every approver's card and PDF.
+
+### Price confirmation (stage 2)
+Bookkeeping confirms the price with the supplier before Finance, GM and the Board approve, so the approvers see the real figure and nothing needs re-approving later. `💲 Confirm / update prices` sends a file with the master price and a blank confirmed-price column; a blank line keeps the master price. `ref_price` keeps the master figure permanently, so approved-versus-confirmed stays visible on PDF page 2 for the life of the PO.
+
+### Supplier codes
+The order PDF prints the **supplier's code (column H) and the supplier's item name**, never the internal CML code. Both codes appear on internal copies, so receiving can map a delivery note back. Column H may be blank — nothing is blocked, but the approved-PO card says how many lines are identified by the supplier's item name alone.
+
+### Chasing approvals
+When GM or the Board approves, Finance is notified. In practice the FM chases approvals, so `/pending` lists every PO awaiting a decision, which stage it sits at, and how many days it has been there.
+
+### Price visibility
+Every supplier-confirmed price that differs from the master list is shown, not only those above tolerance — bookkeeping confirms each price before the approvers see the PO, so a 5% rise is precisely what they are being asked to approve.
+
+It appears on **page 1 only**, under the unit price in the order table, so the change sits with the item it belongs to. A legend under the table explains the `<<` mark, used for changes at or above `OTHER_PRICE_TOLERANCE_PCT`. Page 2 stays a pure approval trail. The supplier copy and the stock controller's price-blind copy show neither.
+
+### Working hours
+Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00–17:00** (`WORK_DAYS`, `WORK_START_HOUR`, `WORK_END_HOUR`, in `TIMEZONE`). Approve at 19:00 on Friday and the PO is recorded for Saturday 08:00; approve on Saturday evening or Sunday and it rolls to Monday. Dating an after-hours approval as "now" would overstate how promptly the order went out.
+
+`order_due` and `order_due_note` are stored on the PO and printed on page 2 as *Send to supplier*. **Public holidays are not handled** — the bot has no holiday calendar, so a Cambodian public holiday is still treated as a working day.
+
+### Receiving
+- **A receipt always belongs to a PO.** Goods arriving against no PO are a process exception handled outside the bot; recording them here would legitimise ordering without approval.
+- The generated file contains **only outstanding lines**, so it shrinks with each delivery.
+- One row per line **per lot** — a line arriving as two lots with different expiry dates uses both its rows. This is the one place the PO validator's duplicate-code rule is deliberately off.
+- **Ambiguous dates are rejected, never guessed.** `03/15/2027` blocks with a message asking for `15-Mar-2027`.
+- **Over-receipt, expired and short-dated confirm rather than block.** Refusing to record what actually arrived just makes the record disagree with the shelf. Discrepancies post to the ordering group, who chase the supplier; nothing is unwound.
+- `Receipts` is append-only. A correction is a **negative row with a reason**, never an edit.
+- The **invoice number** is the delivery reference, since GRN/GDN paperwork is not common practice locally. `Receiving now` is deliberately not pre-filled from the invoice, so the number recorded is one that was counted.
+
+### Cancellation (monthly)
+`/outstanding` in the Finance group lists every open line across all POs with a `Remove?` column. Removal cancels **only the un-received remainder** — a line at 6-of-10 cancels 4 and stays at 6 received. Lines are marked cancelled with a mandatory reason, never deleted: deleting would erase the evidence that the item was ever ordered.
 
 Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier copy); page 2 is the internal approval trail. A reject at any stage returns the PO to the requester with the reason; after they fix it, the PO **re-runs from the Stock controller** with every earlier sign-off cleared.
 
@@ -46,7 +98,7 @@ Use your existing **Supplier MasterList** sheet. Copy its ID into `SPREADSHEET_I
 - **`Reagent Master`** (`MASTER_TAB`) — `No. / Material Code / CML Reagent / Supplier / Supplier Reagent / Price / Pack`.
 - **`Other Master`** (`OTHER_MASTER_TAB`) — same shape, with `Name` and `Unit` in place of `CML Reagent` and `Pack`. Non-reagent items must be pre-registered here with a code, a supplier and a price.
 - The bot **only reads** both tabs. It never writes to a priced catalogue — that would put the requester back in the price-setting seat.
-- **`POs`**, **`Line_Items`**, **`Uploads`**, **`Upload_Rows`** — created automatically.
+- **`POs`**, **`Line_Items`**, **`Uploads`**, **`Upload_Rows`**, **`Receipts`**, **`Stock_Counts`** — created automatically.
 - **`Other_Items`** — the old free-entry list. No longer read or written; keep it as a frozen record so past POs stay explainable.
 
 ### Audit trail
@@ -60,7 +112,8 @@ Use your existing **Supplier MasterList** sheet. Copy its ID into `SPREADSHEET_I
 1. Push to GitHub and create a Railway project from it.
 2. Set the variables from `.env.example`. **Rename the master tab and set `MASTER_TAB` in the same moment** — `get_master` returns `[]` for a missing tab, and an empty master means every upload fails with everything `not_found`.
 3. Get the 7 group chat IDs with `/chatid` in each group.
-4. Deploy. Railway runs `worker: python bot.py`.
+4. Make the bot an admin with **Pin messages** in each group, then run `/setup` once per group. It unpins whatever was there and pins that group's own commands — each group sees only what it needs.
+5. Deploy. Railway runs `worker: python bot.py`.
 
 ## Telegram setup notes
 
@@ -71,6 +124,10 @@ Use your existing **Supplier MasterList** sheet. Copy its ID into `SPREADSHEET_I
 
 - `/new` — create a PO (DM only)
 - `/mypos` — your POs and their status
+- `/setup` — post and pin this group's own command card (run once in each group)
+- `/pending` — POs awaiting approval and for how long (finance group)
+- `/receive <po>` — goods receipt (stock controller group)
+- `/outstanding` — monthly cancellation review (finance group)
 - `/mastercheck` — list codes duplicated across the master tabs
 - `/chatid`, `/myid`
 
@@ -86,7 +143,7 @@ python bot.py
 Validation logic has no Telegram or Sheets dependency, so the tests run anywhere:
 
 ```bash
-pip install pytest && python -m pytest test_upload_validate.py -q
+pip install pytest && python -m pytest -q
 ```
 
 ## Files
@@ -99,7 +156,11 @@ pip install pytest && python -m pytest test_upload_validate.py -q
 - `upload_validate.py` — pure validation, no I/O
 - `upload_excel.py` — template generation, workbook reading, validation report
 - `upload_handlers.py` — Telegram wiring for the upload path
-- `test_upload_validate.py` — 17 tests
+- `receipt_validate.py` / `receipt_excel.py` — goods receipt, pure + Excel layers
+- `side_excel.py` — stock count, price confirmation, cancellation review
+- `post_handlers.py` — Telegram wiring for the post-approval stages
+- `group_handlers.py` — per-group command cards, pinning, and the finance chase list
+- `test_upload_validate.py`, `test_receipt_validate.py` — 37 tests
 
 ## Before first use
 
