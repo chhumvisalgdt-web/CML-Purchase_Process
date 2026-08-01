@@ -13,6 +13,7 @@ import asyncio
 import logging
 from datetime import datetime
 
+from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 from telegram.constants import ParseMode
 from telegram.ext import CommandHandler
 
@@ -28,14 +29,15 @@ GROUP_CARDS = {
     "stock": {
         "title": "Stock controller",
         "role": ("Check the request against what is on the shelf, then record "
-                 "what arrives once it has been ordered."),
+                 "what arrives once the order has gone out."),
         "steps": [
             "Tap <b>Enter stock on hand</b> and fill in the file the bot sends. "
             "Enter <code>#N/A</code> where you cannot count. This is required "
             "before the PO can move on.",
             "Tap <b>Checked</b> to pass it to Bookkeeping, or <b>Reject</b> and "
             "reply with the reason.",
-            "When goods arrive, send <code>/receive &lt;PO number&gt;</code>. "
+            "You are told when a PO is approved. When the goods arrive, send "
+            "<code>/receive &lt;PO number&gt;</code>. "
             "The bot sends a file with only the lines still outstanding.",
             "Enter what you <b>counted</b>, not what the invoice says. One row "
             "per lot. Invoice number and date are required.",
@@ -80,7 +82,8 @@ GROUP_CARDS = {
             "Tap <b>Approve</b> or <b>Reject</b> (reply with the reason).",
             "Urgent POs are approved after Finance and arrive here for "
             "information only.",
-            "The card shows stock on hand next to the quantity requested.",
+            "The order table shows stock on hand next to the quantity "
+            "requested, so you can judge whether the amount is reasonable.",
         ],
         "cmds": [("/mypos", "POs you raised"), ("/chatid", "this group's ID")],
     },
@@ -90,8 +93,8 @@ GROUP_CARDS = {
         "steps": [
             "Tap <b>Approve</b> or <b>Reject</b> (reply with the reason).",
             "Urgent POs arrive here for information only.",
-            "PDF page 2 shows every sign-off before yours, and flags any price "
-            "the supplier confirmed above the master list.",
+            "Page 1 shows stock on hand, and any price the supplier confirmed "
+            "that differs from the master list. Page 2 is the sign-off trail.",
         ],
         "cmds": [("/mypos", "POs you raised"), ("/chatid", "this group's ID")],
     },
@@ -117,6 +120,51 @@ GROUP_CARDS = {
         "cmds": [("/chatid", "this group's ID")],
     },
 }
+
+
+# What the "/" menu offers. Telegram shows nothing unless setMyCommands is
+# called, and scopes let each group get its own short list instead of one
+# combined menu where most entries do not apply.
+PRIVATE_COMMANDS = [
+    ("new", "Start a purchase order"),
+    ("mypos", "Your POs and their status"),
+    ("myid", "Show your Telegram user ID"),
+]
+# Commands offered in every group, on top of that group's own.
+COMMON_GROUP_COMMANDS = [
+    ("mypos", "Your POs and their status"),
+    ("setup", "Re-pin this group's instructions"),
+    ("chatid", "Show this chat's ID"),
+]
+GROUP_COMMANDS = {
+    "stock": [("receive", "Record a delivery: /receive <PO number>")],
+    "fin": [("pending", "POs awaiting approval, and for how long"),
+            ("outstanding", "Monthly review: cancel undelivered lines")],
+}
+
+
+async def publish_commands(app):
+    """Called once at startup. A group whose chat ID is not configured is
+    skipped -- setMyCommands on an unknown chat just errors."""
+    bot = app.bot
+    try:
+        await bot.set_my_commands(
+            [BotCommand(c, d) for c, d in PRIVATE_COMMANDS],
+            scope=BotCommandScopeAllPrivateChats())
+    except Exception as e:
+        log.warning("could not set private commands: %s", e)
+
+    for key, chat_id in Config.CHAT_IDS.items():
+        if not chat_id:
+            continue
+        cmds = GROUP_COMMANDS.get(key, []) + COMMON_GROUP_COMMANDS
+        try:
+            await bot.set_my_commands(
+                [BotCommand(c, d) for c, d in cmds],
+                scope=BotCommandScopeChat(chat_id=chat_id))
+        except Exception as e:
+            log.warning("could not set commands for %s (%s): %s",
+                        key, chat_id, e)
 
 
 def _card(key):
@@ -145,6 +193,14 @@ async def cmd_setup(update, context):
         await context.bot.unpin_all_chat_messages(chat_id=chat_id)
     except Exception as e:
         log.warning("unpin failed in %s: %s", chat_id, e)
+
+    cmds = GROUP_COMMANDS.get(key, []) + COMMON_GROUP_COMMANDS
+    try:
+        await context.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in cmds],
+            scope=BotCommandScopeChat(chat_id=chat_id))
+    except Exception as e:
+        log.warning("could not refresh commands in %s: %s", chat_id, e)
 
     msg = await context.bot.send_message(
         chat_id=chat_id, text=_card(key), parse_mode=ParseMode.HTML,

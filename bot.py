@@ -669,7 +669,8 @@ async def _on_error(update, context):
 def build_app():
     request = HTTPXRequest(connection_pool_size=16, read_timeout=60,
                            write_timeout=60, connect_timeout=20, pool_timeout=30)
-    app = Application.builder().token(Config.BOT_TOKEN).request(request).build()
+    app = (Application.builder().token(Config.BOT_TOKEN).request(request)
+           .post_init(group_handlers.publish_commands).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("mypos", cmd_mypos))

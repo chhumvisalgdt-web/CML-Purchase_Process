@@ -32,7 +32,7 @@ There is no ordering gate — nobody taps "Ordered". The trade-off is that `orde
 ## Post-approval stages
 
 ### Stock count (stage 1)
-The stock controller must enter units on hand before passing the PO on — `📊 Enter stock on hand` sends a small Excel file. `#N/A` is a permitted answer where a count is not possible, and it never coerces to 0: zero means "none in stock", which is the strongest possible argument *for* the order. Counts land in `Stock_Counts` (append-only) and appear on every approver's card and PDF.
+The stock controller must enter units on hand before passing the PO on — `📊 Enter stock on hand` sends a small Excel file. `#N/A` is a permitted answer where a count is not possible, and it never coerces to 0: zero means "none in stock", which is the strongest possible argument *for* the order. Counts land in `Stock_Counts` (append-only) and appear as a **Stock** column on the order table of every approver's PDF, next to the quantity requested — the count exists so Finance, GM and the Board can judge whether the amount asked for is reasonable, so it has to be on their copy, not just the stock controller's.
 
 ### Price confirmation (stage 2)
 Bookkeeping confirms the price with the supplier before Finance, GM and the Board approve, so the approvers see the real figure and nothing needs re-approving later. `💲 Confirm / update prices` sends a file with the master price and a blank confirmed-price column; a blank line keeps the master price. `ref_price` keeps the master figure permanently, so approved-versus-confirmed stays visible on PDF page 2 for the life of the PO.
@@ -112,7 +112,9 @@ Use your existing **Supplier MasterList** sheet. Copy its ID into `SPREADSHEET_I
 1. Push to GitHub and create a Railway project from it.
 2. Set the variables from `.env.example`. **Rename the master tab and set `MASTER_TAB` in the same moment** — `get_master` returns `[]` for a missing tab, and an empty master means every upload fails with everything `not_found`.
 3. Get the 7 group chat IDs with `/chatid` in each group.
-4. Make the bot an admin with **Pin messages** in each group, then run `/setup` once per group. It unpins whatever was there and pins that group's own commands — each group sees only what it needs.
+4. Make the bot an admin with **Pin messages** in each group, then run `/setup` once per group. It unpins whatever was there and pins that group's own instructions — each group sees only what it needs.
+
+Typing `/` shows a menu of that chat's commands. It is published automatically on every start, scoped per chat, so the stock group is offered `/receive` and the finance group `/pending` and `/outstanding` rather than one combined list where most entries do not apply. A group whose chat ID is not yet configured is skipped, so set the IDs and redeploy before expecting its menu.
 5. Deploy. Railway runs `worker: python bot.py`.
 
 ## Telegram setup notes

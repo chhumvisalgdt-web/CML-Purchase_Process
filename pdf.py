@@ -179,16 +179,16 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
     if show_prices:
         with pdf.table(
             width=178,
-            col_widths=(8, 30, 22, 38, 14, 9, 28, 29),
+            col_widths=(9, 27, 20, 34, 14, 10, 14, 25, 25),
             text_align=("CENTER", "LEFT", "LEFT", "LEFT", "LEFT", "RIGHT",
-                        "RIGHT", "RIGHT"),
+                        "RIGHT", "RIGHT", "RIGHT"),
             headings_style=headings,
             line_height=7,
             first_row_as_headings=True,
         ) as table:
             head = table.row()
-            for h in ["No", "CML code", "Supplier code", "Item", "Pack", "Qty",
-                      "Unit price", "Total"]:
+            for h in ["No", "CML code", "Sup. code", "Item", "Pack", "Qty",
+                      "Stock", "Unit price", "Total"]:
                 head.cell(h)
             for i, it in enumerate(items, 1):
                 r = table.row()
@@ -198,9 +198,10 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 r.cell(str(it.get("item", "")))
                 r.cell(str(it.get("pack", "")))
                 r.cell(str(it.get("qty", "")))
-                # The change belongs next to the price, not only in the note on
-                # page 2 -- an approver reading the order table should not have
-                # to turn the page to see that the price moved.
+                # The stock count exists so Finance, GM and the Board can judge
+                # whether the quantity is reasonable -- it has to appear on
+                # THEIR copy, not only the stock controller's.
+                r.cell(str(it.get("on_hand", "") or "-"))
                 d = _flow.price_drift(it)
                 price = _money(it.get("unit_price", 0))
                 if d:
@@ -211,7 +212,7 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 r.cell(price)
                 r.cell(_money(it.get("line_total", 0)))
             tot = table.row()
-            for _ in range(6):
+            for _ in range(7):
                 tot.cell("")
             tot.cell("Total", style=bold)
             tot.cell(_money(po.get("total", 0)), style=bold)
