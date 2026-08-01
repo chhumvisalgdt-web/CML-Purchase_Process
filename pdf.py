@@ -231,7 +231,19 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
         for note in drift_notes:
             pdf.multi_cell(0, 6, "  -  " + note, new_x="LMARGIN", new_y="NEXT")
 
-    # Requester's justification when a pricier supplier was chosen over a cheaper variant.
+    # Requester's justification for the supplier chosen for the whole PO. The
+    # supplier is picked once, before any item is seen, so this is PO-level.
+    if show_prices and str(po.get("supplier_reason", "")).strip():
+        pdf.ln(2)
+        pdf.set_font(FONT, "", 11)
+        pdf.set_text_color(*ORANGE)
+        pdf.cell(0, 7, "Supplier choice (a cheaper supplier existed):",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(0, 6, "  -  " + str(po.get("supplier_reason", "")),
+                       new_x="LMARGIN", new_y="NEXT")
+
+    # Per-line remarks typed in the template's Note column.
     if show_prices:
         sel_notes = [f"{it.get('item', '')}: {str(it.get('variant_reason', '')).strip()}"
                      for it in items if str(it.get("variant_reason", "")).strip()]
@@ -239,7 +251,7 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
             pdf.ln(2)
             pdf.set_font(FONT, "", 11)
             pdf.set_text_color(*ORANGE)
-            pdf.cell(0, 7, "Supplier selection (a cheaper variant existed):",
+            pdf.cell(0, 7, "Line notes from the request file:",
                      new_x="LMARGIN", new_y="NEXT")
             pdf.set_text_color(0, 0, 0)
             for note in sel_notes:

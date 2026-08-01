@@ -36,7 +36,10 @@ class Config:
     # Master list location. Leave MASTER_SPREADSHEET_ID blank to use the same spreadsheet,
     # or set it (+ MASTER_TAB) to read your existing "Supplier MasterList" sheet directly.
     MASTER_SPREADSHEET_ID = os.environ.get("MASTER_SPREADSHEET_ID", "")
-    MASTER_TAB = os.environ.get("MASTER_TAB", "Table1")
+    MASTER_TAB = os.environ.get("MASTER_TAB", "Reagent Master")
+    # "Other" catalogue: pre-registered items with code, supplier and price.
+    # The bot READS this tab only -- it must never write to a priced catalogue.
+    OTHER_MASTER_TAB = os.environ.get("OTHER_MASTER_TAB", "Other Master")
 
     # ---- Behaviour ----
     TIMEZONE = os.environ.get("TIMEZONE", "Asia/Phnom_Penh")
@@ -57,6 +60,10 @@ class Config:
         "approved": _to_int(os.environ.get("APPROVED_PO_CHAT_ID")),
         "cash": _to_int(os.environ.get("CASH_ADVANCE_CHAT_ID")),
     }
+
+    # ---- Excel upload path ----
+    MAX_LINES = _to_int(os.environ.get("MAX_LINES")) or 12
+    MAX_UPLOAD_BYTES = (_to_int(os.environ.get("MAX_UPLOAD_MB")) or 2) * 1024 * 1024
 
     # ---- Optional approver locks (comma-separated user IDs; empty = anyone in the group) ----
     APPROVERS = {

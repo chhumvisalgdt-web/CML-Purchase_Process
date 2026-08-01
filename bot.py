@@ -1,6 +1,5 @@
 """CML Purchase Order approval bot (Telegram + Google Sheets)."""
 import asyncio
-import difflib
 import html
 import logging
 import re
@@ -17,9 +16,10 @@ from telegram.ext import (
 )
 
 from config import Config
-from sheets import sheets, norm_supplier
+from sheets import sheets
 from pdf import generate_po_pdf, ensure_fonts
 import flow
+import upload_handlers
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("fontTools").setLevel(logging.WARNING)
@@ -33,6 +33,9 @@ WELCOME = (
     "\u2022 /chatid \u2014 show this chat's ID (run it inside a group to get the group ID)\n"
     "\u2022 /myid \u2014 show your Telegram user ID"
 )
+
+
+_po_lock = asyncio.Lock()
 
 
 def now_str():
@@ -161,31 +164,10 @@ async def cmd_new(update, context):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please create POs in a private chat with me \u2014 send /new in DM.")
         return
-    context.user_data["draft"] = {"items": [], "supplier": None, "urgent": None,
-                                  "reason": None, "category": None, "editing_po": None}
-    context.user_data["state"] = None
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f9ea Laboratory consumption", callback_data="cat:lab")],
-        [InlineKeyboardButton("\U0001f4e6 Other", callback_data="cat:other")],
-    ])
-    await update.message.reply_text("New PO \u2014 choose the type:", reply_markup=kb)
-
-
-async def _cb_category(q, context, cat):
-    if cat not in flow.CATEGORY_LABEL:
-        return
-    draft = _draft(context)
-    draft["category"] = cat
-    context.user_data["state"] = "item"
-    label = flow.CATEGORY_LABEL[cat]
-    if cat == "other":
-        await q.message.reply_text(
-            f"*{label}* PO. Send the item name \u2014 I'll suggest from your Other list, "
-            f"or you can add a new one.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await q.message.reply_text(
-            f"*{label}* PO. Send the *item name* (or part of it) to search the master list.",
-            parse_mode=ParseMode.MARKDOWN)
+    context.user_data.clear()
+    await update.message.reply_text(
+        "New PO \u2014 send me the items as a filled template.",
+        reply_markup=upload_handlers.entry_keyboard())
 
 
 async def cmd_mypos(update, context):
@@ -198,6 +180,22 @@ async def cmd_mypos(update, context):
     for p in pos[-15:]:
         stg = flow.STAGE_LABEL.get(p.get("stage"), p.get("stage"))
         lines.append(f"PO #{p['po_no']} \u2014 {stg} ({p.get('status', '')})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_mastercheck(update, context):
+    """List codes duplicated across the two master tabs. Such a code cannot
+    identify one item, so it is unorderable until the sheet is corrected."""
+    index = await upload_handlers.master_index()
+    if not index.dup_codes:
+        await update.message.reply_text(
+            f"No duplicate codes. {len(index.by_code)} item(s) orderable.")
+        return
+    lines = [f"{len(index.dup_codes)} duplicated code(s) \u2014 these cannot be "
+             f"ordered until the master list is fixed:", ""]
+    lines += [f"  {c}" for c in sorted(index.dup_codes)[:40]]
+    if len(index.dup_codes) > 40:
+        lines.append(f"  \u2026 and {len(index.dup_codes) - 40} more")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -221,7 +219,8 @@ def _items_keyboard(draft):
     if editing:
         for i, it in enumerate(draft["items"]):
             rows.append([InlineKeyboardButton(f"\u270f\ufe0f {it['item']} \u00d7{it['qty']}", callback_data=f"ei:{i}")])
-    rows.append([InlineKeyboardButton("\u2795 Add item", callback_data="addmore")])
+    rows.append([InlineKeyboardButton(
+        "\U0001f4c4 Upload a replacement file", callback_data="up:ask")])
     rows.append([InlineKeyboardButton(
         "\U0001f501 Resubmit PO" if editing else "\u2705 Submit PO",
         callback_data="resub" if editing else "submit")])
@@ -235,401 +234,20 @@ async def _show_items(target, context, prefix=""):
     await target.reply_text(text, reply_markup=_items_keyboard(draft))
 
 
-async def _ask_quantity(target, context, item):
-    context.user_data["pending_item"] = item
-    context.user_data["state"] = "qty"
-    lines = [f"Item: {item['item']}"]
-    if item.get("material_code"):
-        lines.append(f"Code: {item['material_code']}")
-    lines.append(f"Supplier: {item['supplier']}")
-    if item.get("supplier_reagent"):
-        lines.append(f"Supplier reagent: {item['supplier_reagent']}")
-    if item.get("pack"):
-        lines.append(f"Pack: {item['pack']}")
-    lines.append("\nHow many? Send a number.")
-    await target.reply_text("\n".join(lines))
-
-
 async def on_text(update, context):
     if update.effective_chat.type != "private":
         await _maybe_capture_reason(update, context)
         return
     state = context.user_data.get("state")
-    if state == "item":
-        await _handle_item_name(update, context)
-    elif state == "qty":
-        await _handle_quantity(update, context)
-    elif state == "other_price":
-        await _handle_other_price(update, context)
-    elif state == "other_reprice":
-        await _handle_other_reprice(update, context)
-    elif state == "other_supplier":
-        await _handle_other_supplier(update, context)
-    elif state == "variant_reason":
-        await _handle_variant_reason(update, context)
+    if state == "supplier_why":
+        await upload_handlers.handle_supplier_why(update, context)
     elif state == "reason":
         await _handle_po_reason(update, context)
     elif state == "editqty":
         await _handle_edit_qty(update, context)
     else:
-        await update.message.reply_text("Send /new to start a PO, or /mypos to see yours.")
-
-
-async def _handle_item_name(update, context):
-    draft = _draft(context)
-    name = update.message.text.strip()
-    if draft.get("category") == "other":
-        await _handle_other_item_name(update, context, name)
-        return
-    matches = await asyncio.to_thread(sheets.find_items, name)
-    if matches:
-        await _route_lab_item(update.message, context, matches)
-        return
-    suggestions = await asyncio.to_thread(sheets.suggest_items, name)
-    if suggestions:
-        context.user_data["suggestions"] = suggestions
-        rows = [[InlineKeyboardButton(s["item"], callback_data=f"pk:{i}")] for i, s in enumerate(suggestions)]
-        rows.append([InlineKeyboardButton("\u2716\ufe0f Cancel", callback_data="cancel")])
-        await update.message.reply_text(f"'{name}' isn't in the master list. Did you mean:",
-                                        reply_markup=InlineKeyboardMarkup(rows))
-    else:
-        await update.message.reply_text(f"No match for '{name}' in the master list. Try another name.")
-
-
-async def _route_lab_item(target, context, matches):
-    """One master row -> quantity. Several rows (same item, different supplier/pack) ->
-    auto-pick the locked supplier's variant, or let the requester choose (prices hidden)."""
-    draft = _draft(context)
-    item_name = matches[0]["item"]
-    if draft["supplier"]:
-        same = [m for m in matches if m["supplier"] == draft["supplier"]]
-        if not same:
-            sups = ", ".join(dict.fromkeys(m["supplier"] for m in matches))
-            await target.reply_text(
-                f"\u26a0\ufe0f This PO is for *{draft['supplier']}*, but {item_name} is available "
-                f"from: *{sups}*. One supplier per PO \u2014 send a different item, or submit this "
-                f"PO and start a new one.", parse_mode=ParseMode.MARKDOWN)
-            return
-        matches = same
-    if len(matches) == 1:
-        await _ask_quantity(target, context, matches[0])
-        return
-    context.user_data["variants"] = matches
-    context.user_data["state"] = "item"  # typing another name simply searches again
-    rows = []
-    for i, m in enumerate(matches):
-        label = m["supplier"]
-        if m.get("pack"):
-            label += f" \u00b7 {m['pack']}"
-        label += f" \u00b7 {flow.money(m.get('unit_price', 0))}"
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"vr:{i}")])
-    await target.reply_text(
-        f"\u201c{item_name}\u201d is available from more than one supplier \u2014 "
-        f"compare and pick one:",
-        reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def _cb_variant(q, context, idx):
-    variants = context.user_data.get("variants") or []
-    if idx < 0 or idx >= len(variants):
-        await q.message.reply_text("That option expired. Send the item name again.")
-        return
-    item = dict(variants[idx])
-    draft = _draft(context)
-    if draft["supplier"] and item["supplier"] != draft["supplier"]:
-        await q.message.reply_text(
-            f"\u26a0\ufe0f One supplier per PO ({draft['supplier']}). {item['item']} is from {item['supplier']}.")
-        return
-    # Compare across SUPPLIERS (cheapest variant per supplier), not across pack sizes:
-    # picking a bigger pack from the same supplier needs no justification, but picking
-    # a supplier whose best price is above another supplier's does.
-    by_sup = {}
-    for v in variants:
-        p = float(v.get("unit_price", 0))
-        s = v["supplier"]
-        by_sup[s] = min(by_sup.get(s, p), p)
-    cheapest_sup = min(by_sup, key=by_sup.get)
-    if by_sup[item["supplier"]] - by_sup[cheapest_sup] > 0.005:
-        context.user_data["pending_variant"] = item
-        context.user_data["variants"] = None
-        context.user_data["state"] = "variant_reason"
-        await q.message.reply_text(
-            f"\U0001f4b2 {cheapest_sup} offers {item['item']} from {flow.money(by_sup[cheapest_sup])}; "
-            f"you picked {item['supplier']} at {flow.money(item['unit_price'])}.\n\n"
-            f"Briefly, why this supplier? (e.g. out of stock, quality, delivery time) \u2014 "
-            f"your note will be shown to the approvers.")
-        return
-    context.user_data.pop("variants", None)
-    await _ask_quantity(q.message, context, item)
-
-
-async def _handle_variant_reason(update, context):
-    item = context.user_data.get("pending_variant")
-    if not item:
-        context.user_data["state"] = "item"
-        await update.message.reply_text("Send the item name.")
-        return
-    reason = update.message.text.strip()
-    if not reason:
-        await update.message.reply_text("Please type a short reason for choosing this supplier.")
-        return
-    item["variant_reason"] = reason
-    context.user_data.pop("pending_variant", None)
-    await _ask_quantity(update.message, context, item)
-
-
-async def _handle_other_item_name(update, context, name):
-    draft = _draft(context)
-    item = await asyncio.to_thread(sheets.find_other_item, name)
-    if item:
-        if draft["supplier"] and item["supplier"] != draft["supplier"]:
-            await update.message.reply_text(
-                f"\u26a0\ufe0f This PO is for *{draft['supplier']}*, but {item['item']} is from "
-                f"*{item['supplier']}*. One supplier per PO.", parse_mode=ParseMode.MARKDOWN)
-            return
-        await _offer_reuse_price(update.message, context, item)
-        return
-    context.user_data["other_typed"] = name
-    suggestions = await asyncio.to_thread(sheets.suggest_other_items, name)
-    rows = []
-    if suggestions:
-        context.user_data["suggestions"] = suggestions
-        rows = [[InlineKeyboardButton(s["item"], callback_data=f"pk:{i}")] for i, s in enumerate(suggestions)]
-    rows.append([InlineKeyboardButton(f"\u2795 Add \u201c{name[:28]}\u201d as new", callback_data="onew")])
-    rows.append([InlineKeyboardButton("\u2716\ufe0f Cancel", callback_data="cancel")])
-    msg = (f"'{name}' isn't in the Other list yet. Pick a match or add it:"
-           if suggestions else f"'{name}' isn't in the Other list yet. Add it as a new item?")
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def _cb_other_new(q, context):
-    name = context.user_data.get("other_typed")
-    if not name:
-        context.user_data["state"] = "item"
-        await q.message.reply_text("Send the item name.")
-        return
-    context.user_data["state"] = "other_price"
-    await q.message.reply_text(f"Adding \u201c{name}\u201d. Send its *unit price* (number).",
-                               parse_mode=ParseMode.MARKDOWN)
-
-
-# ---- reusing an existing "Other" item: confirm or update its price ----
-async def _offer_reuse_price(target, context, item):
-    context.user_data["pending_other"] = dict(item)
-    context.user_data["state"] = "item"  # typing another name simply searches again
-    last = flow.money(item.get("unit_price", 0))
-    lines = [f"\U0001f501 {item['item']}", f"Supplier: {item['supplier']}", f"Last price: {last}"]
-    upd_at, upd_by = item.get("updated_at", ""), item.get("updated_by", "")
-    if upd_at or upd_by:
-        lines.append("(updated " + " by ".join(x for x in (upd_at, upd_by) if x) + ")")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"\u2705 Use {last}", callback_data="op:keep")],
-        [InlineKeyboardButton("\u270f\ufe0f Enter new price", callback_data="op:new")],
-    ])
-    await target.reply_text("\n".join(lines), reply_markup=kb)
-
-
-async def _cb_other_reuse(q, context, act):
-    item = context.user_data.get("pending_other")
-    if not item:
-        context.user_data["state"] = "item"
-        await q.message.reply_text("That item expired. Send the item name again.")
-        return
-    if act == "keep":
-        it = dict(item)
-        it["ref_price"] = it["unit_price"]
-        context.user_data.pop("pending_other", None)
-        await _ask_quantity(q.message, context, it)
-    elif act in ("new", "re"):
-        context.user_data["state"] = "other_reprice"
-        await q.message.reply_text(
-            f"Send the new unit price for \u201c{item['item']}\u201d "
-            f"(last: {flow.money(item['unit_price'])}).")
-    elif act == "cfm":
-        new_price = context.user_data.pop("reprice_val", None)
-        if new_price is None:
-            context.user_data["state"] = "other_reprice"
-            await q.message.reply_text("Send the new unit price.")
-            return
-        it = dict(item)
-        it["ref_price"] = it["unit_price"]
-        it["unit_price"] = new_price
-        context.user_data.pop("pending_other", None)
-        await _ask_quantity(q.message, context, it)
-
-
-async def _handle_other_reprice(update, context):
-    item = context.user_data.get("pending_other")
-    if not item:
-        context.user_data["state"] = "item"
-        await update.message.reply_text("Send the item name.")
-        return
-    try:
-        price = float(update.message.text.strip().replace("$", "").replace(",", ""))
-        if price < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Send a valid price, e.g. 18.50")
-        return
-    price = round(price, 2)
-    ref = float(item.get("unit_price", 0))
-    if abs(price - ref) <= 0.005:  # same price — nothing changed
-        it = dict(item)
-        it["ref_price"] = ref
-        context.user_data.pop("pending_other", None)
-        context.user_data["state"] = None
-        await _ask_quantity(update.message, context, it)
-        return
-    tol = Config.OTHER_PRICE_TOLERANCE_PCT
-    pct = ((price - ref) / ref * 100.0) if ref > 0 else None
-    if pct is None or abs(pct) >= tol:
-        context.user_data["reprice_val"] = price
-        pct_txt = f" ({pct:+.0f}%)" if pct is not None else ""
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"\u2705 Confirm {flow.money(price)}", callback_data="op:cfm")],
-            [InlineKeyboardButton("\u21a9\ufe0f Re-enter price", callback_data="op:re")],
-        ])
         await update.message.reply_text(
-            f"\u26a0\ufe0f {flow.money(ref)} \u2192 {flow.money(price)}{pct_txt} \u2014 outside the "
-            f"\u00b1{tol:.0f}% tolerance.\nApprovers will see this change flagged. Confirm?",
-            reply_markup=kb)
-        return
-    it = dict(item)
-    it["ref_price"] = ref
-    it["unit_price"] = price
-    context.user_data.pop("pending_other", None)
-    context.user_data["state"] = None
-    await _ask_quantity(update.message, context, it)
-
-
-async def _handle_other_price(update, context):
-    try:
-        price = float(update.message.text.strip().replace("$", "").replace(",", ""))
-        if price < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Send a valid price, e.g. 18.50")
-        return
-    context.user_data["other_price_val"] = round(price, 2)
-    await _ask_other_supplier(update.message, context, user=update.effective_user)
-
-
-# ---- supplier entry for a new "Other" item (pick-from-known first) ----
-async def _ask_other_supplier(target, context, user=None):
-    draft = _draft(context)
-    name = context.user_data.get("other_typed", "this item")
-    if draft["supplier"]:  # PO already locked to one supplier — don't ask, just use it
-        await target.reply_text(f"Supplier: {draft['supplier']} (this PO's supplier).")
-        await _finish_new_other(target, context, draft["supplier"], user=user)
-        return
-    opts = (await asyncio.to_thread(sheets.other_suppliers))[:8]
-    context.user_data["supplier_opts"] = opts
-    context.user_data["state"] = "other_supplier"
-    if opts:
-        rows = [[InlineKeyboardButton(s[:40], callback_data=f"sup:{i}")] for i, s in enumerate(opts)]
-        rows.append([InlineKeyboardButton("\u2795 New supplier", callback_data="supnew")])
-        await target.reply_text(f"Supplier for \u201c{name}\u201d? Pick one or type a name:",
-                                reply_markup=InlineKeyboardMarkup(rows))
-    else:
-        await target.reply_text(f"Supplier for \u201c{name}\u201d? Type the name:")
-
-
-async def _cb_supplier_pick(q, context, idx):
-    opts = context.user_data.get("supplier_opts") or []
-    if idx < 0 or idx >= len(opts):
-        await q.message.reply_text("That option expired. Type the supplier name.")
-        return
-    await _finish_new_other(q.message, context, opts[idx], user=q.from_user)
-
-
-async def _cb_supplier_fix(q, context, use_match):
-    typed = context.user_data.pop("supplier_typed", None)
-    match = context.user_data.pop("supplier_match", None)
-    chosen = match if use_match else typed
-    if not chosen:
-        context.user_data["state"] = "other_supplier"
-        await q.message.reply_text("Type the supplier name.")
-        return
-    await _finish_new_other(q.message, context, chosen, user=q.from_user)
-
-
-async def _handle_other_supplier(update, context):
-    draft = _draft(context)
-    typed = update.message.text.strip()
-    if not typed:
-        await update.message.reply_text("Send the supplier name.")
-        return
-    if draft["supplier"] and typed != draft["supplier"]:
-        await update.message.reply_text(
-            f"\u26a0\ufe0f This PO is for *{draft['supplier']}*. Use the same supplier, "
-            f"or start a new PO.", parse_mode=ParseMode.MARKDOWN)
-        return
-    known = await asyncio.to_thread(sheets.all_known_suppliers)
-    nt = norm_supplier(typed)
-    # Same name modulo case/punctuation ("abc co." vs "ABC Co") — merge silently.
-    exact = next((s for s in known if norm_supplier(s) == nt), None)
-    if exact:
-        if exact != typed:
-            await update.message.reply_text(f"Using existing supplier \u201c{exact}\u201d.")
-        await _finish_new_other(update.message, context, exact, user=update.effective_user)
-        return
-    # Close-but-not-equal (likely typo) — ask before creating a near-duplicate.
-    close = difflib.get_close_matches(nt, [norm_supplier(s) for s in known], n=1, cutoff=0.85)
-    if close:
-        match = next(s for s in known if norm_supplier(s) == close[0])
-        context.user_data["supplier_typed"] = typed
-        context.user_data["supplier_match"] = match
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"\u2705 Use \u201c{match[:35]}\u201d", callback_data="supfix:1")],
-            [InlineKeyboardButton(f"\u2795 Keep \u201c{typed[:35]}\u201d as new", callback_data="supfix:0")],
-        ])
-        await update.message.reply_text(
-            f"\u201c{typed}\u201d looks like existing supplier \u201c{match}\u201d. Same one?",
-            reply_markup=kb)
-        return
-    await _finish_new_other(update.message, context, typed, user=update.effective_user)
-
-
-async def _finish_new_other(target, context, supplier, user=None):
-    name = context.user_data.get("other_typed", "")
-    price = context.user_data.get("other_price_val", 0.0)
-    item = {"item": name, "unit_price": price, "ref_price": price, "supplier": supplier,
-            "material_code": "", "supplier_reagent": "", "pack": ""}
-    by = fullname(user) if user else ""
-    await asyncio.to_thread(sheets.add_other_item, name, price, supplier, by, now_str())
-    for k in ("other_typed", "other_price_val", "supplier_opts"):
-        context.user_data.pop(k, None)
-    await _ask_quantity(target, context, item)
-
-
-async def _handle_quantity(update, context):
-    item = context.user_data.get("pending_item")
-    if not item:
-        context.user_data["state"] = "item"
-        await update.message.reply_text("Send the item name.")
-        return
-    try:
-        qty = int(update.message.text.strip())
-        if qty <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Please send a whole number greater than 0.")
-        return
-    draft = _draft(context)
-    if draft["supplier"] is None:
-        draft["supplier"] = item["supplier"]
-    draft["items"].append({
-        "item": item["item"], "qty": qty, "unit_price": item["unit_price"],
-        "line_total": round(item["unit_price"] * qty, 2),
-        "ref_price": item.get("ref_price", item["unit_price"]),
-        "variant_reason": item.get("variant_reason", ""),
-        "material_code": item.get("material_code", ""),
-        "supplier_reagent": item.get("supplier_reagent", ""),
-        "pack": item.get("pack", ""),
-    })
-    context.user_data["state"] = None
-    context.user_data.pop("pending_item", None)
-    await _show_items(update.message, context, prefix="\u2705 Added.")
+            "Send /new to start a PO, or /mypos to see yours.")
 
 
 async def _handle_po_reason(update, context):
@@ -671,28 +289,13 @@ async def _handle_edit_qty(update, context):
 async def on_callback(update, context):
     q = update.callback_query
     data = q.data or ""
-    await q.answer()
-    if data.startswith("cat:"):
-        await _cb_category(q, context, data.split(":")[1])
-    elif data == "onew":
-        await _cb_other_new(q, context)
-    elif data.startswith("op:"):
-        await _cb_other_reuse(q, context, data.split(":")[1])
-    elif data == "supnew":
-        context.user_data["state"] = "other_supplier"
-        await q.message.reply_text("Type the supplier name.")
-    elif data.startswith("supfix:"):
-        await _cb_supplier_fix(q, context, data.split(":")[1] == "1")
-    elif data.startswith("sup:"):
-        await _cb_supplier_pick(q, context, int(data.split(":")[1]))
-    elif data.startswith("vr:"):
-        await _cb_variant(q, context, int(data.split(":")[1]))
-    elif data.startswith("pk:"):
-        await _cb_pick(q, context, int(data.split(":")[1]))
-    elif data == "addmore":
-        context.user_data["state"] = "item"
-        await q.message.reply_text("Send the next item name.")
-    elif data == "submit":
+    # _cb_action answers the query itself (with show_alert for "not authorized"
+    # / "already processed"). Telegram allows ONE answer per query, so answering
+    # here first made those alerts raise BadRequest -- which aborted the handler
+    # before it could strip the stale buttons.
+    if not data.startswith("a:"):
+        await q.answer()
+    if data == "submit":
         await _cb_submit(q, context)
     elif data.startswith("u:"):
         await _cb_urgent(q, context, data.split(":")[1] == "1")
@@ -711,32 +314,19 @@ async def on_callback(update, context):
         await _cb_action(q, context, data)
 
 
-async def _cb_pick(q, context, idx):
-    suggestions = context.user_data.get("suggestions") or []
-    if idx < 0 or idx >= len(suggestions):
-        await q.message.reply_text("That option expired. Send the item name again.")
-        return
-    item = suggestions[idx]
-    draft = _draft(context)
-    if draft.get("category") == "other":
-        if draft["supplier"] and item["supplier"] != draft["supplier"]:
-            await q.message.reply_text(
-                f"\u26a0\ufe0f One supplier per PO ({draft['supplier']}). {item['item']} is from {item['supplier']}.")
-            return
-        await _offer_reuse_price(q.message, context, item)
-        return
-    # Lab: the suggestion carries one row, but the item may exist under several
-    # suppliers/packs — re-resolve so all variants are considered.
-    matches = await asyncio.to_thread(sheets.find_items, item["item"]) or [item]
-    await _route_lab_item(q.message, context, matches)
+async def _ask_reason(target, context):
+    """Shared by the submit button and the upload path."""
+    msg = getattr(target, "message", None) or target
+    context.user_data["state"] = "reason"
+    await msg.reply_text(
+        "What is the reason / purpose for this PO? Reply with a short note.")
 
 
 async def _cb_submit(q, context):
     if not _draft(context)["items"]:
         await q.message.reply_text("Add at least one item first.")
         return
-    context.user_data["state"] = "reason"
-    await q.message.reply_text("What is the reason / purpose for this PO? Reply with a short note.")
+    await _ask_reason(q, context)
 
 
 async def _ask_urgent(target):
@@ -769,21 +359,6 @@ async def _cb_urgent(q, context, urgent):
     await q.message.reply_text("\n".join(lines), reply_markup=kb)
 
 
-async def _sync_other_prices(draft, by):
-    """After submitting an Other-category PO, make changed prices the new reference
-    in Other_Items. Per-PO history stays in Line_Items (ref_price vs unit_price)."""
-    if draft.get("category") != "other":
-        return
-    for it in draft["items"]:
-        ref = float(it.get("ref_price", it["unit_price"]))
-        if abs(float(it["unit_price"]) - ref) > 0.005:
-            try:
-                await asyncio.to_thread(sheets.update_other_item_price,
-                                        it["item"], it["unit_price"], by, now_str())
-            except Exception as e:
-                log.warning("Could not update reference price for %s: %s", it["item"], e)
-
-
 async def _cb_confirm(q, context):
     draft = _draft(context)
     if draft.get("editing_po"):
@@ -794,7 +369,8 @@ async def _cb_confirm(q, context):
         return
     user = q.from_user
     total = round(sum(it["line_total"] for it in draft["items"]), 2)
-    po_no = await asyncio.to_thread(sheets.next_po_no)
+    async with _po_lock:
+        po_no = await asyncio.to_thread(sheets.next_po_no)
     po = {
         "po_no": po_no, "created_at": now_str(),
         "requester_id": user.id, "requester_name": fullname(user),
@@ -803,10 +379,14 @@ async def _cb_confirm(q, context):
         "reason": draft.get("reason", ""),
         "category": flow.CATEGORY_LABEL.get(draft.get("category"), ""),
         "stage": flow.STAGE_STOCK, "status": "active", "updated_at": now_str(),
+        "upload_id": draft.get("upload_id", ""),
+        "supplier_reason": draft.get("supplier_reason", ""),
     }
     await asyncio.to_thread(sheets.create_po, po)
     await asyncio.to_thread(sheets.add_line_items, po_no, draft["items"])
-    await _sync_other_prices(draft, fullname(user))
+    if draft.get("upload_id"):
+        await asyncio.to_thread(sheets.log_upload_result,
+                                draft["upload_id"], "submitted", None, po_no)
     context.user_data.clear()
     await q.message.reply_text(f"\u2705 PO #{po_no} submitted. It's now with the Stock controller.")
     await post_stage(context, po_no)
@@ -817,6 +397,14 @@ async def _cb_edit_open(q, context, po_no):
     if not po:
         await q.message.reply_text("PO not found.")
         return
+    # Without these two guards an old button could reset a PO that is already
+    # mid-approval -- or already approved -- back to the Stock controller.
+    if str(po.get("requester_id")).strip() != str(q.from_user.id):
+        await q.message.reply_text("Only the requester can edit this PO.")
+        return
+    if str(po.get("status")).strip() != "returned":
+        await q.message.reply_text(f"PO #{po_no} is no longer waiting for changes.")
+        return
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
     context.user_data["draft"] = {
         "items": [dict(it) for it in items],
@@ -826,8 +414,11 @@ async def _cb_edit_open(q, context, po_no):
         "editing_po": po_no,
     }
     context.user_data["state"] = None
-    await _show_items(q.message, context,
-                      prefix=f"Editing PO #{po_no}. Tap an item to change its quantity, add items, then resubmit.")
+    context.user_data["upload_editing_po"] = po_no
+    await _show_items(
+        q.message, context,
+        prefix=f"Editing PO #{po_no}. Tap an item to change its quantity, or "
+               f"upload a replacement file, then resubmit.")
 
 
 async def _cb_edit_item(q, context, idx):
@@ -852,12 +443,18 @@ async def _cb_resubmit(q, context):
         return
     total = round(sum(it["line_total"] for it in draft["items"]), 2)
     await asyncio.to_thread(sheets.replace_line_items, po_no, draft["items"])
-    await _sync_other_prices(draft, fullname(q.from_user))
+    # Clear every earlier sign-off. Without this the revised PO arrives at the
+    # Stock controller with "Checked by" / "Booked by" already filled in from
+    # the previous pass -- approvals that were never given on this document.
     await asyncio.to_thread(
         sheets.update_po, po_no, supplier=draft["supplier"], total=total,
         urgent="yes" if draft["urgent"] else "no", reason=draft.get("reason", ""),
         stage=flow.STAGE_STOCK, status="active",
-        reject_stage="", reject_reason="", updated_at=now_str())
+        reject_stage="", reject_reason="", updated_at=now_str(),
+        stock_by="", stock_at="", book_by="", book_at="",
+        fin_by="", fin_at="", gm_by="", gm_at="", board_by="", board_at="",
+        payment_type="", supplier_reason=draft.get("supplier_reason", ""),
+        upload_id=draft.get("upload_id", ""))
     context.user_data.clear()
     await q.message.reply_text(f"\U0001f501 PO #{po_no} resubmitted. Back to the Stock controller.")
     await post_stage(context, po_no)
@@ -902,6 +499,7 @@ async def _cb_action(q, context, data):
         return
 
     if act in ("ok", "booked", "ca", "ap"):
+        await q.answer()
         by_col, at_col = flow.STAGE_AUDIT[stage]
         fields = {by_col: fullname(user), at_col: now_str(), "updated_at": now_str()}
         pay = flow.PAYMENT_LABEL.get(act) if stage == flow.STAGE_FIN else None
@@ -923,6 +521,7 @@ async def _cb_action(q, context, data):
             await asyncio.to_thread(sheets.update_po, po_no, stage=nxt, updated_at=now_str())
             await post_stage(context, po_no)
     elif act == "no":
+        await q.answer()
         context.chat_data["await_reason"] = {
             "po_no": po_no, "user_id": user.id, "stage": stage, "msg_id": q.message.message_id,
         }
@@ -984,7 +583,12 @@ def build_app():
     app.add_handler(CommandHandler("mypos", cmd_mypos))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("myid", cmd_myid))
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(CommandHandler("mastercheck", cmd_mastercheck))
+    # Registration order matters: within a group the first handler added wins.
+    # The upload router must come BEFORE the generic one, or every "up:" tap is
+    # swallowed with no error and nothing in the logs.
+    upload_handlers.register(app, {"ask_reason": _ask_reason})
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(?!up:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(_on_error)
     return app

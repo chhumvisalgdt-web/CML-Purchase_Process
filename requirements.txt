@@ -3,3 +3,4 @@ gspread==6.1.2
 google-auth==2.34.0
 fpdf2==2.8.7
 uharfbuzz==0.55.0
+openpyxl==3.1.5

@@ -27,12 +27,35 @@ PO_HEADERS = [
     "stock_by", "stock_at", "book_by", "book_at", "fin_by", "fin_at",
     "gm_by", "gm_at", "board_by", "board_at",
     "reject_stage", "reject_reason", "updated_at", "reason", "category", "payment_type",
+    "upload_id", "supplier_reason",
 ]
 LINE_HEADERS = ["po_no", "line_id", "material_code", "item", "supplier_reagent", "pack",
                 "qty", "unit_price", "line_total", "ref_price", "variant_reason"]
-# Reusable reference list for the "Other" category (bot reads and appends to it).
-# unit_price is the current reference price; updated_at/updated_by record its last change.
+# Frozen record of the old free-entry "Other" list. The bot no longer reads or
+# writes it -- "Other" items now live in Config.OTHER_MASTER_TAB with a code,
+# a supplier and a price, exactly like reagents. Kept only so past POs remain
+# explainable.
 OTHER_HEADERS = ["item", "unit_price", "supplier", "updated_at", "updated_by"]
+
+# ---- Excel upload audit tabs ----
+# Uploads records one row PER ATTEMPT, written before parsing decides anything.
+# sheet_count / max_row are taken from the workbook BEFORE row iteration: parsed
+# output alone can never show that a row was silently dropped.
+UPLOAD_HEADERS = [
+    "upload_id", "uploaded_at", "uploaded_by", "uploaded_by_id", "file_name",
+    "file_id", "sha256", "size", "sheet_count", "sheet_names", "max_row",
+    "rows_in_range", "populated_below_range", "template_version",
+    "template_supplier", "template_category", "rows_populated", "rows_ok",
+    "rows_blocked", "derived_supplier", "derived_category", "template_matches",
+    "result", "po_no", "supersedes",
+]
+# Upload_Rows records every row the READER SAW, raw values verbatim, before
+# validation is applied. A log of what passed says nothing about what was
+# rejected; the gap between raw_* and matched_* is the audit evidence.
+UPLOAD_ROW_HEADERS = [
+    "upload_id", "row_no", "raw_code", "raw_qty", "raw_note", "status",
+    "message", "matched_code", "matched_item", "matched_supplier", "matched_pack",
+]
 
 
 def _to_float(v):
@@ -102,7 +125,8 @@ class Sheets:
     def ensure_tabs(self):
         self._ws("POs", PO_HEADERS)
         self._ws("Line_Items", LINE_HEADERS)
-        self._ws("Other_Items", OTHER_HEADERS)
+        self._ws("Uploads", UPLOAD_HEADERS)
+        self._ws("Upload_Rows", UPLOAD_ROW_HEADERS)
         # If the master list is meant to be in the main spreadsheet, make sure the tab exists.
         mid = Config.MASTER_SPREADSHEET_ID or Config.SPREADSHEET_ID
         if mid == Config.SPREADSHEET_ID:
@@ -117,18 +141,17 @@ class Sheets:
         except Exception:
             return ""
 
-    # ---- master list ----
-    def get_master(self, force=False):
-        if (not force) and self._master_cache is not None and (time.time() - self._master_cache_at) < 60:
-            return self._master_cache
+    # ---- master lists ----
+    def _read_master_tab(self, tab, category):
+        """Read one master tab. Column headers are matched by name so both
+        `Reagent Master` (CML Reagent / Pack) and `Other Master` (Name / Unit)
+        work without a schema change."""
         try:
-            ws = self._open_master().worksheet(Config.MASTER_TAB)
+            ws = self._open_master().worksheet(tab)
         except gspread.WorksheetNotFound:
-            self._master_cache, self._master_cache_at = [], time.time()
             return []
         rows = ws.get_all_values()
         if not rows:
-            self._master_cache, self._master_cache_at = [], time.time()
             return []
         norm = [_norm(h) for h in rows[0]]
 
@@ -139,12 +162,12 @@ class Sheets:
             return -1
 
         ci = {
-            "name": idx("cml reagent", "reagent", "item"),
+            "name": idx("cml reagent", "reagent", "item", "name"),
             "code": idx("material code", "code"),
             "supplier": idx("supplier"),
             "sreagent": idx("supplier reagent"),
             "price": idx("price", "unit price"),
-            "pack": idx("pack"),
+            "pack": idx("pack", "unit"),
         }
         out = []
         for r in rows[1:]:
@@ -161,8 +184,35 @@ class Sheets:
                 "supplier_reagent": g("sreagent"),
                 "unit_price": _to_float(g("price")),
                 "pack": g("pack"),
+                "category": category,
             })
+        return out
+
+    def get_master(self, force=False):
+        if (not force) and self._master_cache is not None and (time.time() - self._master_cache_at) < 60:
+            return self._master_cache
+        out = self._read_master_tab(Config.MASTER_TAB, "reagent")
         self._master_cache, self._master_cache_at = out, time.time()
+        return out
+
+    def get_other_master(self, force=False):
+        """Read-only. The bot must never write to a catalogue that carries prices:
+        that would put the requester back in the price-setting seat."""
+        if (not force) and self._other_cache is not None and (time.time() - self._other_cache_at) < 60:
+            return self._other_cache
+        out = self._read_master_tab(Config.OTHER_MASTER_TAB, "other")
+        self._other_cache, self._other_cache_at = out, time.time()
+        return out
+
+    def all_known_suppliers(self):
+        """Distinct suppliers across both master tabs, original casing.
+        Feeds the template picker."""
+        seen, out = set(), []
+        for m in self.get_master() + self.get_other_master():
+            s = m["supplier"]
+            if s and norm_supplier(s) not in seen:
+                seen.add(norm_supplier(s))
+                out.append(s)
         return out
 
     def find_items(self, name):
@@ -189,89 +239,6 @@ class Sheets:
         subs = [x for x in names if name.strip().lower() in x.lower() and x not in matches]
         chosen = (matches + subs)[:n]
         return [by_name[x.lower()] for x in chosen]
-
-    # ---- "Other" reusable list ----
-    def get_other_master(self, force=False):
-        if (not force) and self._other_cache is not None and (time.time() - self._other_cache_at) < 300:
-            return self._other_cache
-        ws = self._ws("Other_Items", OTHER_HEADERS)
-        out = []
-        for r in ws.get_all_records(expected_headers=OTHER_HEADERS):
-            name = str(r.get("item", "")).strip()
-            if not name:
-                continue
-            out.append({
-                "item": name,
-                "unit_price": _to_float(r.get("unit_price")),
-                "supplier": str(r.get("supplier", "")).strip(),
-                "updated_at": str(r.get("updated_at", "")).strip(),
-                "updated_by": str(r.get("updated_by", "")).strip(),
-                "material_code": "", "supplier_reagent": "", "pack": "",
-            })
-        self._other_cache, self._other_cache_at = out, time.time()
-        return out
-
-    def find_other_item(self, name):
-        name_l = name.strip().lower()
-        for m in self.get_other_master():
-            if m["item"].lower() == name_l:
-                return m
-        return None
-
-    def suggest_other_items(self, name, n=6):
-        master = self.get_other_master()
-        names = [m["item"] for m in master]
-        matches = difflib.get_close_matches(name, names, n=n, cutoff=0.4)
-        subs = [x for x in names if name.strip().lower() in x.lower() and x not in matches]
-        chosen = (matches + subs)[:n]
-        by_name = {m["item"]: m for m in master}
-        return [by_name[x] for x in chosen]
-
-    def add_other_item(self, item, unit_price, supplier, by="", at=""):
-        if self.find_other_item(item):
-            return
-        ws = self._ws("Other_Items", OTHER_HEADERS)
-        ws.append_row([item, unit_price, supplier, at, by], value_input_option="USER_ENTERED")
-        self._other_cache = None
-
-    def update_other_item_price(self, item, unit_price, by="", at=""):
-        """Set a new reference price for an existing Other item (no-op if unchanged).
-        Per-PO prices remain in Line_Items, so this keeps no history of its own."""
-        ws = self._ws("Other_Items", OTHER_HEADERS)
-        name_l = str(item).strip().lower()
-        col = ws.col_values(1)
-        for rownum, v in enumerate(col, start=1):
-            if rownum == 1:
-                continue
-            if str(v).strip().lower() == name_l:
-                cur = _to_float(ws.cell(rownum, OTHER_HEADERS.index("unit_price") + 1).value)
-                if abs(cur - float(unit_price)) <= 0.005:
-                    return False
-                ws.update_cell(rownum, OTHER_HEADERS.index("unit_price") + 1, unit_price)
-                ws.update_cell(rownum, OTHER_HEADERS.index("updated_at") + 1, at)
-                ws.update_cell(rownum, OTHER_HEADERS.index("updated_by") + 1, by)
-                self._other_cache = None
-                return True
-        return False
-
-    def other_suppliers(self):
-        """Distinct suppliers from the Other list, most recently added first."""
-        seen, out = set(), []
-        for m in reversed(self.get_other_master()):
-            s = m["supplier"]
-            if s and norm_supplier(s) not in seen:
-                seen.add(norm_supplier(s))
-                out.append(s)
-        return out
-
-    def all_known_suppliers(self):
-        """Distinct suppliers across the Other list and the master list (original casing)."""
-        seen, out = set(), []
-        for s in self.other_suppliers() + [m["supplier"] for m in self.get_master()]:
-            if s and norm_supplier(s) not in seen:
-                seen.add(norm_supplier(s))
-                out.append(s)
-        return out
 
     # ---- PO numbering ----
     def next_po_no(self):
@@ -316,9 +283,11 @@ class Sheets:
         rownum = self._find_po_row(ws, po_no)
         if not rownum:
             return False
-        for key, val in fields.items():
-            if key in PO_HEADERS:
-                ws.update_cell(rownum, PO_HEADERS.index(key) + 1, val)
+        reqs = [{"range": gspread.utils.rowcol_to_a1(rownum, PO_HEADERS.index(k) + 1),
+                 "values": [[v]]}
+                for k, v in fields.items() if k in PO_HEADERS]
+        if reqs:
+            ws.batch_update(reqs, value_input_option="USER_ENTERED")
         return True
 
     # ---- line items ----
@@ -354,14 +323,68 @@ class Sheets:
         return out
 
     def replace_line_items(self, po_no, items):
+        """Delete only this PO's rows. The old implementation cleared the whole
+        tab and rewrote it, so a failure between the two lost every PO's line
+        items -- and upload-driven resubmit puts this on the hot path."""
         ws = self._ws("Line_Items", LINE_HEADERS)
-        values = ws.get_all_values()
-        header = values[0] if values else LINE_HEADERS
-        body = values[1:] if len(values) > 1 else []
-        keep = [header] + [r for r in body if r and str(r[0]).strip() != str(po_no)]
-        ws.clear()
-        ws.update(values=keep, range_name="A1")
+        doomed = [i for i, v in enumerate(ws.col_values(1), start=1)
+                  if i > 1 and str(v).strip() == str(po_no)]
+        for rownum in reversed(doomed):
+            ws.delete_rows(rownum)
         self.add_line_items(po_no, items)
+
+    # ---- upload audit trail ----
+    def log_upload_start(self, user, meta, supersedes=None):
+        """Written BEFORE parsing decides anything. Returns the upload_id."""
+        ws = self._ws("Uploads", UPLOAD_HEADERS)
+        upload_id = f"U{int(time.time() * 1000)}"
+        row = {"upload_id": upload_id,
+               "uploaded_at": time.strftime("%d-%b-%Y %H:%M:%S"),
+               "uploaded_by": getattr(user, "full_name", "") or "",
+               "uploaded_by_id": getattr(user, "id", ""),
+               "result": "reading", "supersedes": supersedes or ""}
+        for k in ("file_name", "file_id", "sha256", "size", "sheet_count",
+                  "sheet_names", "max_row", "rows_in_range",
+                  "populated_below_range", "template_version",
+                  "template_supplier", "template_category"):
+            row[k] = meta.get(k, "") or ""
+        ws.append_row([row.get(h, "") for h in UPLOAD_HEADERS],
+                      value_input_option="USER_ENTERED")
+        return upload_id
+
+    def log_upload_rows(self, upload_id, report):
+        """Every row the reader saw, raw values verbatim, in sheet order."""
+        ws = self._ws("Upload_Rows", UPLOAD_ROW_HEADERS)
+        rows = [[upload_id] + [r.get(h, "") for h in UPLOAD_ROW_HEADERS[1:]]
+                for r in report]
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+    def log_upload_result(self, upload_id, result, summary=None, po_no=""):
+        """result: reading | blocked | checked | cancelled | submitted."""
+        ws = self._ws("Uploads", UPLOAD_HEADERS)
+        rownum = next((i for i, v in enumerate(ws.col_values(1), start=1)
+                       if str(v).strip() == str(upload_id)), None)
+        if not rownum:
+            return False
+        s = summary or {}
+        vals = {"result": result}
+        if summary:
+            vals.update({
+                "rows_populated": s.get("rows_populated", ""),
+                "rows_ok": s.get("rows_ok", ""),
+                "rows_blocked": s.get("rows_blocked", ""),
+                "derived_supplier": s.get("supplier", ""),
+                "derived_category": s.get("category", ""),
+                "template_matches": "yes" if s.get("template_matches", True) else "NO",
+            })
+        if po_no:
+            vals["po_no"] = po_no
+        ws.batch_update(
+            [{"range": gspread.utils.rowcol_to_a1(rownum, UPLOAD_HEADERS.index(k) + 1),
+              "values": [[v]]} for k, v in vals.items() if v != ""],
+            value_input_option="USER_ENTERED")
+        return True
 
 
 sheets = Sheets()
