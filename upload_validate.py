@@ -84,6 +84,34 @@ def to_units(value):
     return v
 
 
+# A pack whose size is stated plainly: "25 Tests", "50/Kit", "25T/Kit",
+# "100pcs/box", "150 test". Deliberately NOT multi-component packs like
+# "1x800+1x200mL" or "4x40+4x10mL" -- the leading 1 or 4 there is a number of
+# bottles, not a number of tests, and reading it as a divisor would produce a
+# confident, wrong percentage.
+_SIMPLE_PACK = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:t\b|test|tests|pcs|"
+                          r"papers?|kit|unit|units)?\s*[/]?\s*"
+                          r"(?:kit|box|bag|pack|unit|test|tests)?\s*$",
+                          re.IGNORECASE)
+
+
+def units_from_pack(pack):
+    """Tests per pack read from the Pack text, or None when it is not obvious.
+
+    Only unambiguous shapes are accepted. Anything containing 'x' or '+' is
+    refused outright: a wrong divisor is worse than no divisor, because the
+    first prints a percentage nobody can tell is nonsense and the second
+    prints a dash.
+    """
+    s = re.sub(r"\s+", " ", str(pack or "")).strip()
+    if not s or "x" in s.lower() or "+" in s:
+        return None
+    m = _SIMPLE_PACK.match(s)
+    if not m:
+        return None
+    return to_units(m.group(1))
+
+
 def per_unit(price, units):
     """Price for one test. None when either side is unknown -- comparing a
     25-test box with a 50-test kit on headline price alone points at the wrong
@@ -144,17 +172,29 @@ class MasterIndex:
                 if r["category"] == category and r["supplier"] == supplier]
 
     def equivalents(self, code):
-        """Master rows registered as the same thing as `code`, from a DIFFERENT
-        supplier. Equivalence is declared in the master's `Equivalent` column,
-        never guessed from item names: 'DENGUE NS1 Ag (25 Tests)' and 'DENGUE
-        NS1 AG FIA (25 Tests)' are one word apart and are different platforms
-        at very different prices. A wrong equivalence on a price-blind PO stays
-        invisible until reconciliation."""
+        """Master rows that are the same thing as `code`, from a DIFFERENT
+        supplier.
+
+        Two rows are the same item when their CML Reagent name matches exactly
+        (case and spacing ignored). That column is CML's own name, under CML's
+        control, which makes it the one field that can be made to line up --
+        unlike Supplier Reagent, which is the supplier's wording and changes
+        when they rebrand. Nothing is guessed: near-misses stay separate, so
+        'DENGUE NS1 Ag' and 'DENGUE NS1 AG FIA' -- different platforms at very
+        different prices -- are never treated as one.
+
+        The consequence is that equivalence is declared by NAMING, not by a
+        separate column: two suppliers' rows only pair up once someone gives
+        them the same CML Reagent name.
+        """
         mine = self.by_code.get(norm_code(code))
-        if not mine or not mine.get("equivalent"):
+        if not mine:
+            return []
+        key = norm_name(mine["item"])
+        if not key:
             return []
         return [r for r in self.by_code.values()
-                if r.get("equivalent") == mine["equivalent"]
+                if norm_name(r["item"]) == key
                 and r["supplier"] != mine["supplier"]]
 
     def excluded_for(self, category, supplier):
@@ -184,11 +224,12 @@ def build_index(reagent_rows, other_rows):
                 "pack": str(raw.get("pack", "")).strip(),
                 "unit_price": to_float(raw.get("unit_price")),
                 "category": category,
-                # Declared equivalence + how many tests are in a pack. Both
-                # optional: blank means "no equivalent known", which is the
-                # case for most of the list.
-                "equivalent": norm_name(raw.get("equivalent")),
-                "tests_per_pack": to_units(raw.get("tests_per_pack")),
+                # How many tests are in one pack -- the divisor that makes a
+                # 25-box and a 50-kit comparable. Read from the optional
+                # 'Tests per pack' column, falling back to the Pack text when
+                # that is unambiguous.
+                "tests_per_pack": (to_units(raw.get("tests_per_pack"))
+                                   or units_from_pack(raw.get("pack"))),
             }
             if code in first_seen:
                 dup.add(code)

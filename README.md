@@ -38,16 +38,20 @@ The stock controller must enter units on hand before passing the PO on — `📊
 Bookkeeping confirms the price with the supplier before Finance, GM and the Board approve, so the approvers see the real figure and nothing needs re-approving later. `💲 Confirm / update prices` sends a file with the master price and a blank confirmed-price column; a blank line keeps the master price. `ref_price` keeps the master figure permanently, so approved-versus-confirmed stays visible on PDF page 2 for the life of the PO.
 
 ### Cross-supplier alternatives
-The same test is often sold by two suppliers under two codes at different prices. Name matching cannot find these -- `HBs Ag (25 Tests)` and `HBsAg Rapid Test 50/Kit` are the same test and share no words -- and guessing is worse than not looking: `DENGUE NS1 Ag` and `DENGUE NS1 AG FIA` are one word apart and are different platforms at $74.80 and $100.10.
+The same test is often sold by two suppliers under two codes at different prices. Two rows are treated as the same item when their **`CML Reagent` name matches exactly** (case and spacing ignored).
 
-Equivalence is therefore **declared, in two optional master columns**:
+That column is the right key because it is *CML's own* name, under CML's control. `Supplier Reagent` is the supplier's wording — it changes when they rebrand, and it is written to their catalogue's conventions, not yours. `Material Code` is unique per row by design, so it can never pair two rows.
 
-- **`Equivalent`** -- free text. Rows sharing the exact value are the same item. Blank on most rows, which means "no equivalent known".
-- **`Tests per pack`** -- a plain number. Without it the row still appears, showing both packs and prices, but `Diff` prints `-` rather than a percentage.
+The consequence is that **equivalence is declared by naming**: two suppliers' rows pair up only once someone gives them the same `CML Reagent` name. Nothing is guessed, so near-misses stay apart — `Dengue NS1 Ag Rapid Test` and `DENGUE NS1 AG FIA` are different platforms at $74.80 and $100.10 and are never treated as one. Renaming is therefore a deliberate act with a visible result, which is the point.
 
-Approver copies then carry an **Also available from another supplier** table under the order: `No / Item / Pack / Price / Alternative supplier / Pack / Price / Diff`. Lines with no equivalent are absent and the whole section disappears when there are none.
+**Pack size** comes from the `Pack` text where it is unambiguous — `25 Tests`, `50/Kit`, `25T/Kit`, `150 test` all parse. Anything containing `x` or `+` is refused: the leading number in `1x800+1x200mL` counts bottles, not tests, and a wrong divisor prints a confident wrong percentage. An optional **`Tests per pack`** column overrides the text when you need it.
 
-**`Diff` is per test, never per pack**, because that is where the money hides: HBs Ag is $15.40 for 25 against $18.50 for 50, so the alternative *looks* 20% dearer and is 40% cheaper. On the current master, three of the seven overlapping tests point the wrong way when read on headline price. The requester and the stock controller never see this table -- the whole flow depends on them not choosing on price.
+Two things then appear:
+
+- **The requester's template** gains `Also sold by` and `Diff` columns, filled in by lookup like Item and Supplier. She sees *"Borey Pharma, −40%"* — a supplier and a relative figure, never a price.
+- **Approver copies** carry an **Also available from another supplier** table under the order: `No / Item / Pack / Price / Alternative supplier / Pack / Price / Diff`. Lines with no equivalent are absent; the section disappears when there are none.
+
+**`Diff` is per test, never per pack**, because that is where the money hides: HBs Ag is $15.40 for 25 against $18.50 for 50, so the alternative *looks* 20% dearer and is 40% cheaper. Where a pack size cannot be read, both prices still show and `Diff` prints `-`.
 
 ### Supplier codes
 The order PDF prints the **supplier's code (column H) and the supplier's item name**, never the internal CML code. The supplier code appears on that copy only — it is the supplier's own reference and means nothing to an approver, so approver copies carry the CML code alone and give the width to the item name. The ordering group keeps the order copy, so a delivery note can still be mapped back to a line. Column H may be blank — nothing is blocked, but the approved-PO card says how many lines are identified by the supplier's item name alone.
@@ -112,7 +116,7 @@ A code that appears more than once across the two master tabs cannot identify on
 
 Use your existing **Supplier MasterList** sheet. Copy its ID into `SPREADSHEET_ID` and share it (Editor) with the service-account email printed in the logs on first start.
 
-- **`Reagent Master`** (`MASTER_TAB`) — `No. / Material Code / CML Reagent / Supplier / Supplier Reagent / Price / Pack / Supplier Material Code`, plus optional `Equivalent` and `Tests per pack` (see Cross-supplier alternatives).
+- **`Reagent Master`** (`MASTER_TAB`) — `No. / Material Code / CML Reagent / Supplier / Supplier Reagent / Price / Pack / Supplier Material Code`, plus optional `Tests per pack` (see Cross-supplier alternatives).
 - **`Other Master`** (`OTHER_MASTER_TAB`) — same shape, with `Name` and `Unit` in place of `CML Reagent` and `Pack`. Non-reagent items must be pre-registered here with a code, a supplier and a price.
 - The bot **only reads** both tabs. It never writes to a priced catalogue — that would put the requester back in the price-setting seat.
 - **`POs`**, **`Line_Items`**, **`Uploads`**, **`Upload_Rows`**, **`Receipts`**, **`Stock_Counts`** — created automatically.
@@ -182,7 +186,7 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `post_handlers.py` — Telegram wiring for the post-approval stages
 - `group_handlers.py` — per-group command cards, pinning, and the finance chase list
 - `clock.py` — the single timezone-aware clock every timestamp comes from
-- `test_upload_validate.py`, `test_receipt_validate.py` — 53 tests
+- `test_upload_validate.py`, `test_receipt_validate.py` — 56 tests
 
 ## Before first use
 
