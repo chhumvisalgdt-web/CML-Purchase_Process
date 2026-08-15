@@ -3,8 +3,6 @@ import asyncio
 import html
 import logging
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -15,6 +13,7 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
+from clock import now_str
 from config import Config
 from sheets import sheets
 from pdf import generate_po_pdf, ensure_fonts
@@ -37,11 +36,12 @@ WELCOME = (
 )
 
 
+# Held across "read the highest PO number" AND "write the new row". Holding it
+# only over the read left a window in which two requesters confirming together
+# were both handed the same number -- and _find_po_row then resolves a
+# duplicate to whichever row comes first, so later approvals land on the wrong
+# PO.
 _po_lock = asyncio.Lock()
-
-
-def now_str():
-    return datetime.now(ZoneInfo(Config.TIMEZONE)).strftime("%d-%b-%Y %H:%M")
 
 
 def fullname(user):
@@ -148,6 +148,17 @@ async def finalize(context, po_no):
                                         text=f"\U0001f389 PO #{po_no} is fully approved.")
     except Exception as e:
         log.warning("Could not DM requester on approval: %s", e)
+
+
+def _missing_supplier_codes(items):
+    """Lines with no supplier code in column H.
+
+    Nothing is blocked -- the supplier's own item name is usually enough to
+    fill an order -- but the approved-PO card says how many lines rest on the
+    name alone, because those are the ones that come back wrong.
+    """
+    return [it for it in items
+            if not str(it.get("supplier_code", "")).strip()]
 
 
 async def _post_approved(context, po_no, po):
@@ -413,20 +424,23 @@ async def _cb_confirm(q, context):
         return
     user = q.from_user
     total = round(sum(it["line_total"] for it in draft["items"]), 2)
+    # The number and the row that claims it are reserved together: releasing
+    # the lock in between hands the same number to a second requester.
     async with _po_lock:
         po_no = await asyncio.to_thread(sheets.next_po_no)
-    po = {
-        "po_no": po_no, "created_at": now_str(),
-        "requester_id": user.id, "requester_name": fullname(user),
-        "supplier": draft["supplier"], "total": total,
-        "urgent": "yes" if draft["urgent"] else "no",
-        "reason": draft.get("reason", ""),
-        "category": flow.CATEGORY_LABEL.get(draft.get("category"), ""),
-        "stage": flow.STAGE_STOCK, "status": "active", "updated_at": now_str(),
-        "upload_id": draft.get("upload_id", ""),
-        "supplier_reason": draft.get("supplier_reason", ""),
-    }
-    await asyncio.to_thread(sheets.create_po, po)
+        po = {
+            "po_no": po_no, "created_at": now_str(),
+            "requester_id": user.id, "requester_name": fullname(user),
+            "supplier": draft["supplier"], "total": total,
+            "urgent": "yes" if draft["urgent"] else "no",
+            "reason": draft.get("reason", ""),
+            "category": flow.CATEGORY_LABEL.get(draft.get("category"), ""),
+            "stage": flow.STAGE_STOCK, "status": "active",
+            "updated_at": now_str(),
+            "upload_id": draft.get("upload_id", ""),
+            "supplier_reason": draft.get("supplier_reason", ""),
+        }
+        await asyncio.to_thread(sheets.create_po, po)
     await asyncio.to_thread(sheets.add_line_items, po_no, draft["items"])
     if draft.get("upload_id"):
         await asyncio.to_thread(sheets.log_upload_result,
@@ -486,7 +500,13 @@ async def _cb_resubmit(q, context):
         await q.message.reply_text("Add at least one item before resubmitting.")
         return
     total = round(sum(it["line_total"] for it in draft["items"]), 2)
-    await asyncio.to_thread(sheets.replace_line_items, po_no, draft["items"])
+    # Drop the stock count along with the sign-offs. It was taken against the
+    # OLD quantities, and leaving it in place satisfies the "enter stock first"
+    # gate, so a PO whose quantity went from 10 to 50 could be passed on
+    # without anyone looking at the shelf again.
+    items = [{k: v for k, v in it.items() if k != "on_hand"}
+             for it in draft["items"]]
+    await asyncio.to_thread(sheets.replace_line_items, po_no, items)
     # Clear every earlier sign-off. Without this the revised PO arrives at the
     # Stock controller with "Checked by" / "Booked by" already filled in from
     # the previous pass -- approvals that were never given on this document.
@@ -583,11 +603,15 @@ async def _cb_action(q, context, data):
             await asyncio.to_thread(sheets.update_po, po_no, stage=nxt, updated_at=now_str())
             await post_stage(context, po_no)
         if stage in (flow.STAGE_GM, flow.STAGE_BOARD):
+            # A PO that reaches "approved" does not stop there -- it is moved
+            # straight on to receiving above, so report where it actually is.
+            landed = (flow.STAGE_RECEIVING if nxt == flow.STAGE_APPROVED
+                      else nxt)
             await _tell_finance(
                 context,
                 f"\u2705 PO #{po_no} \u00b7 {po.get('supplier', '')} approved by "
                 f"{flow.STAGE_LABEL[stage]} ({fullname(user)}).\n"
-                f"Now at: {flow.STAGE_LABEL.get(nxt, nxt)}.")
+                f"Now at: {flow.STAGE_LABEL.get(landed, landed)}.")
     elif act == "no":
         await q.answer()
         context.chat_data["await_reason"] = {

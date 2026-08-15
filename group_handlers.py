@@ -13,6 +13,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from clock import local_now
+
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 from telegram.constants import ParseMode
 from telegram.ext import CommandHandler
@@ -219,8 +221,8 @@ async def cmd_setup(update, context):
 def _age_days(created):
     for fmt in ("%d-%b-%Y %H:%M", "%d-%b-%Y"):
         try:
-            return (datetime.now() - datetime.strptime(str(created).strip(),
-                                                       fmt)).days
+            return (local_now() - datetime.strptime(str(created).strip(),
+                                                    fmt)).days
         except ValueError:
             continue
     return None

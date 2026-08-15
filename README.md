@@ -38,7 +38,7 @@ The stock controller must enter units on hand before passing the PO on — `📊
 Bookkeeping confirms the price with the supplier before Finance, GM and the Board approve, so the approvers see the real figure and nothing needs re-approving later. `💲 Confirm / update prices` sends a file with the master price and a blank confirmed-price column; a blank line keeps the master price. `ref_price` keeps the master figure permanently, so approved-versus-confirmed stays visible on PDF page 2 for the life of the PO.
 
 ### Supplier codes
-The order PDF prints the **supplier's code (column H) and the supplier's item name**, never the internal CML code. Both codes appear on internal copies, so receiving can map a delivery note back. Column H may be blank — nothing is blocked, but the approved-PO card says how many lines are identified by the supplier's item name alone.
+The order PDF prints the **supplier's code (column H) and the supplier's item name**, never the internal CML code. The supplier code appears on that copy only — it is the supplier's own reference and means nothing to an approver, so approver copies carry the CML code alone and give the width to the item name. The ordering group keeps the order copy, so a delivery note can still be mapped back to a line. Column H may be blank — nothing is blocked, but the approved-PO card says how many lines are identified by the supplier's item name alone.
 
 ### Chasing approvals
 When GM or the Board approves, Finance is notified. In practice the FM chases approvals, so `/pending` lists every PO awaiting a decision, which stage it sits at, and how many days it has been there.
@@ -47,6 +47,9 @@ When GM or the Board approves, Finance is notified. In practice the FM chases ap
 Every supplier-confirmed price that differs from the master list is shown, not only those above tolerance — bookkeeping confirms each price before the approvers see the PO, so a 5% rise is precisely what they are being asked to approve.
 
 It appears on **page 1 only**, under the unit price in the order table, so the change sits with the item it belongs to. A legend under the table explains the `<<` mark, used for changes at or above `OTHER_PRICE_TOLERANCE_PCT`. Page 2 stays a pure approval trail. The supplier copy and the stock controller's price-blind copy show neither.
+
+### One clock
+Every timestamp the bot writes comes from `clock.py` in `TIMEZONE`. Approvals, receipts, stock counts, price confirmations, cancellations, the `Uploads` log and the generated files all agree, and expiry is judged against the local date. A container running UTC does not shift half the audit trail seven hours behind the other half.
 
 ### Working hours
 Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00–17:00** (`WORK_DAYS`, `WORK_START_HOUR`, `WORK_END_HOUR`, in `TIMEZONE`). Approve at 19:00 on Friday and the PO is recorded for Saturday 08:00; approve on Saturday evening or Sunday and it rolls to Monday. Dating an after-hours approval as "now" would overstate how promptly the order went out.
@@ -64,6 +67,8 @@ Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00
 
 ### Cancellation (monthly)
 `/outstanding` in the Finance group lists every open line across all POs with a `Remove?` column. Removal cancels **only the un-received remainder** — a line at 6-of-10 cancels 4 and stays at 6 received. Lines are marked cancelled with a mandatory reason, never deleted: deleting would erase the evidence that the item was ever ordered.
+
+A cancelled quantity stops being expected everywhere at once: it drops off the receipt file, the 7th unit against a 10-line with 4 cancelled is flagged as over-receipt, and a PO whose whole remainder is cancelled closes. There is one definition of "still owed" — `ordered − cancelled − received` — and the review list and the receiving path both use it.
 
 Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier copy); page 2 is the internal approval trail. A reject at any stage returns the PO to the requester with the reason; after they fix it, the PO **re-runs from the Stock controller** with every earlier sign-off cleared.
 
@@ -142,10 +147,12 @@ export STOCK_CHAT_ID=... BOOKKEEPING_CHAT_ID=... FINANCE_CHAT_ID=... GM_CHAT_ID=
 python bot.py
 ```
 
-Validation logic has no Telegram or Sheets dependency, so the tests run anywhere:
+The validation modules themselves import neither Telegram nor gspread, but the
+suite also covers the working-hours rules in `flow.py`, so install the
+requirements first:
 
 ```bash
-pip install pytest && python -m pytest -q
+pip install -r requirements.txt pytest && python -m pytest -q
 ```
 
 ## Files
@@ -162,7 +169,8 @@ pip install pytest && python -m pytest -q
 - `side_excel.py` — stock count, price confirmation, cancellation review
 - `post_handlers.py` — Telegram wiring for the post-approval stages
 - `group_handlers.py` — per-group command cards, pinning, and the finance chase list
-- `test_upload_validate.py`, `test_receipt_validate.py` — 37 tests
+- `clock.py` — the single timezone-aware clock every timestamp comes from
+- `test_upload_validate.py`, `test_receipt_validate.py` — 48 tests
 
 ## Before first use
 

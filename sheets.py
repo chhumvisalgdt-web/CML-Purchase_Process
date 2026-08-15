@@ -13,6 +13,7 @@ import difflib
 import gspread
 from google.oauth2.service_account import Credentials
 
+import clock
 from config import Config
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -322,6 +323,27 @@ class Sheets:
                 return i
         return None
 
+    def _verified_po_row(self, ws, po_no):
+        """Row number, re-checked against column A before it is used to WRITE.
+
+        The cache survives edits made in the browser. Delete a row in POs and
+        every cached row number below it is off by one -- so an approval would
+        be written onto a neighbouring PO, silently and with a real name and
+        timestamp on it. get_po already re-checked; writes did not.
+        """
+        rownum = self._find_po_row(ws, po_no)
+        if not rownum:
+            return None
+        try:
+            actual = str(ws.cell(rownum, 1).value or "").strip()
+        except Exception:
+            return rownum
+        if actual == str(po_no):
+            return rownum
+        self._po_rows.pop(str(po_no), None)
+        rownum = self._find_po_row(ws, po_no)
+        return rownum
+
     def get_po(self, po_no):
         """One column scan (usually cached) plus one row fetch. The old version
         pulled the entire POs tab through get_all_records on every call, and
@@ -350,7 +372,7 @@ class Sheets:
 
     def update_po(self, po_no, **fields):
         ws = self._ws("POs", PO_HEADERS)
-        rownum = self._find_po_row(ws, po_no)
+        rownum = self._verified_po_row(ws, po_no)
         if not rownum:
             return False
         reqs = [{"range": gspread.utils.rowcol_to_a1(rownum, PO_HEADERS.index(k) + 1),
@@ -413,18 +435,22 @@ class Sheets:
 
     # ---- goods receipt ----
     def get_receipts(self, po_no):
-        """Query by PO rather than reading the whole tab. Receipts is the
-        fastest-growing tab (one row per line per lot per delivery) and sits on
-        the receiving hot path, so a full scan here ages badly."""
+        """ONE request, whatever the size of the tab.
+
+        The previous version looked the PO up with findall and then fetched
+        each hit with its own row_values call: a 12-line PO delivered in two
+        lots cost 25 API reads, and /receive calls this twice. Google allows
+        about 60 reads a minute, so the receiving path was one busy delivery
+        away from failing. A single get_all_values and a filter in Python is
+        one request no matter how far Receipts grows.
+        """
         ws = self._ws("Receipts", RECEIPT_HEADERS)
-        try:
-            cells = ws.findall(str(po_no), in_column=2)
-        except Exception:
-            cells = []
+        rows = ws.get_all_values()
         out = []
-        for c in cells:
-            vals = ws.row_values(c.row)
-            vals += [""] * (len(RECEIPT_HEADERS) - len(vals))
+        for vals in rows[1:]:
+            if len(vals) < 2 or str(vals[1]).strip() != str(po_no):
+                continue
+            vals = list(vals) + [""] * (len(RECEIPT_HEADERS) - len(vals))
             r = {h: vals[i] for i, h in enumerate(RECEIPT_HEADERS)}
             r["qty_received"] = int(_to_float(r.get("qty_received")))
             out.append(r)
@@ -463,14 +489,21 @@ class Sheets:
 
     def update_lines(self, po_no, by_line_id):
         """by_line_id: {line_id: {column: value}}. One batch_update for the
-        whole PO rather than a call per cell."""
+        whole PO rather than a call per cell.
+
+        The line_id column is fetched once, not cell by cell: a 12-line PO was
+        costing 12 reads here on top of the column scan, and stock count,
+        price confirmation and cancellation all come through this path.
+        """
         ws, rownums = self._line_rows(po_no)
         if not rownums:
             return 0
         lid_col = LINE_HEADERS.index("line_id") + 1
+        lid_col_values = ws.col_values(lid_col)
         reqs = []
         for rownum in rownums:
-            lid = str(ws.cell(rownum, lid_col).value or "").strip()
+            lid = (str(lid_col_values[rownum - 1]).strip()
+                   if rownum <= len(lid_col_values) else "")
             fields = by_line_id.get(lid)
             if not fields:
                 continue
@@ -533,7 +566,7 @@ class Sheets:
         ws = self._ws("Uploads", UPLOAD_HEADERS)
         upload_id = f"U{int(time.time() * 1000)}"
         row = {"upload_id": upload_id,
-               "uploaded_at": time.strftime("%d-%b-%Y %H:%M:%S"),
+               "uploaded_at": clock.now_str("%d-%b-%Y %H:%M:%S"),
                "uploaded_by": getattr(user, "full_name", "") or "",
                "uploaded_by_id": getattr(user, "id", ""),
                "result": "reading", "supersedes": supersedes or ""}

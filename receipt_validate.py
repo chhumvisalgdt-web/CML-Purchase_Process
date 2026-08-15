@@ -27,6 +27,10 @@ ST_NOT_OUTSTANDING = "not_outstanding"
 ST_UNKNOWN_CODE = "unknown_code"
 ST_BAD_QTY = "bad_qty"
 ST_BAD_INVOICE_QTY = "bad_invoice_qty"
+# A missing invoice NUMBER is a header problem, not a bad invoice quantity on
+# some row. It used to be logged under bad_invoice_qty, which put the wrong
+# cause in the audit record for the commonest blocking mistake there is.
+ST_MISSING_INVOICE = "missing_invoice_no"
 ST_MISSING_LOT = "missing_lot"
 ST_BAD_EXPIRY = "bad_expiry"
 ST_AMBIGUOUS_EXPIRY = "ambiguous_expiry"
@@ -41,8 +45,8 @@ ST_SHORT_DATED = "short_dated"
 
 BLOCKING = {
     ST_NOT_OUTSTANDING, ST_UNKNOWN_CODE, ST_BAD_QTY, ST_BAD_INVOICE_QTY,
-    ST_MISSING_LOT, ST_BAD_EXPIRY, ST_AMBIGUOUS_EXPIRY, ST_MISSING_EXPIRY,
-    ST_NEGATIVE_TOTAL, ST_NOTHING_ENTERED,
+    ST_MISSING_INVOICE, ST_MISSING_LOT, ST_BAD_EXPIRY, ST_AMBIGUOUS_EXPIRY,
+    ST_MISSING_EXPIRY, ST_NEGATIVE_TOTAL, ST_NOTHING_ENTERED,
 }
 CONFIRMABLE = {ST_OVER_RECEIPT, ST_EXPIRED, ST_SHORT_DATED}
 
@@ -297,7 +301,7 @@ def validate(rows, outstanding, invoice_no="", invoice_date=None, today=None,
         report.append({
             "row_no": None, "raw_code": "", "raw_qty": "", "raw_invoice_qty": "",
             "raw_lot": "", "raw_expiry": "", "raw_note": "",
-            "status": ST_BAD_INVOICE_QTY,
+            "status": ST_MISSING_INVOICE,
             "message": "Invoice number is missing. It is the link between this "
                        "record and the supplier's paperwork.",
             "line_id": "", "matched_item": "",
@@ -348,7 +352,16 @@ def validate(rows, outstanding, invoice_no="", invoice_date=None, today=None,
 
 def outstanding_from(line_items, receipts):
     """Build the outstanding map. Lines already fully received are omitted, so
-    the generated file shrinks with each delivery."""
+    the generated file shrinks with each delivery.
+
+    A cancelled quantity is no longer expected, so it is subtracted from what
+    is still owed. Without that subtraction the monthly review wrote
+    'cancelled' into the sheet and nothing acted on it: the line stayed
+    receivable, and because the PO only closes when this map empties, a PO
+    whose remainder was cancelled stayed open for ever -- while dropping off
+    the review list, which does count cancellations. Open, still receivable,
+    and invisible.
+    """
     got = {}
     for r in receipts:
         lid = str(r.get("line_id", ""))
@@ -358,13 +371,18 @@ def outstanding_from(line_items, receipts):
     for it in line_items:
         lid = str(it.get("line_id", ""))
         ordered = to_int(it.get("qty")) or 0
+        cancelled = to_int(it.get("cancelled_qty")) or 0
+        # What is still expected. Over-receipt is judged against this too: if
+        # 4 of 10 were cancelled, the 7th unit to arrive is one too many.
+        expected = max(ordered - cancelled, 0)
         received = got.get(lid, 0)
-        if received >= ordered:
+        if received >= expected:
             continue
         code = norm_code(it.get("material_code"))
         if not code:
             continue
         out[code] = {"line_id": lid, "item": it.get("item", ""),
-                     "pack": it.get("pack", ""), "ordered": ordered,
+                     "pack": it.get("pack", ""), "ordered": expected,
+                     "ordered_gross": ordered, "cancelled": cancelled,
                      "received": received}
     return out

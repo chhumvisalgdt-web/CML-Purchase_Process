@@ -98,6 +98,12 @@ class MasterIndex:
     by_code: dict = field(default_factory=dict)
     dup_codes: set = field(default_factory=set)
     best_by_item: dict = field(default_factory=dict)
+    # code -> {(category, supplier)} for every row a duplicated code appeared
+    # on. Duplicates are dropped from by_code, so without this the template can
+    # only report how many codes are duplicated ANYWHERE -- which told a
+    # requester ordering from one supplier that 12 items were unavailable when
+    # none of them were his.
+    dup_where: dict = field(default_factory=dict)
 
     def suppliers(self, category=None):
         out, seen = [], set()
@@ -116,12 +122,19 @@ class MasterIndex:
         return [r for r in self.by_code.values()
                 if r["category"] == category and r["supplier"] == supplier]
 
+    def excluded_for(self, category, supplier):
+        """How many duplicated codes would have belonged on THIS template.
+        What the requester needs to know is what is missing from the file in
+        front of her, not the size of the master list's problem."""
+        return sum(1 for where in self.dup_where.values()
+                   if (category, supplier) in where)
+
 
 def build_index(reagent_rows, other_rows):
     """reagent_rows / other_rows: dicts with material_code, item, supplier,
     unit_price, and optionally pack and supplier_reagent."""
     by_code, dup, first_seen = {}, set(), {}
-    best = {}
+    best, dup_where = {}, {}
     for rows, category in ((reagent_rows, CAT_REAGENT), (other_rows, CAT_OTHER)):
         for raw in rows:
             code = norm_code(raw.get("material_code"))
@@ -140,6 +153,13 @@ def build_index(reagent_rows, other_rows):
             if code in first_seen:
                 dup.add(code)
                 by_code.pop(code, None)
+                # Remember every place this code claimed to live -- the first
+                # row's home as well as this one -- so a template can say how
+                # many of ITS items went missing.
+                seen = first_seen[code]
+                dup_where.setdefault(code, set()).add(
+                    (seen["category"], seen["supplier"]))
+                dup_where[code].add((category, row["supplier"]))
                 continue
             first_seen[code] = row
             by_code[code] = row
@@ -151,7 +171,8 @@ def build_index(reagent_rows, other_rows):
                 sup = row["supplier"]
                 if sup and (sup not in cur or price < cur[sup]):
                     cur[sup] = price
-    return MasterIndex(by_code=by_code, dup_codes=dup, best_by_item=best)
+    return MasterIndex(by_code=by_code, dup_codes=dup, best_by_item=best,
+                       dup_where=dup_where)
 
 
 @dataclass

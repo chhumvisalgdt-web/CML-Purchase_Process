@@ -1,14 +1,10 @@
 """Stage order, transitions, keyboards, and the PO summary text (HTML-formatted)."""
 import html
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from clock import local_now
 from config import Config
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
 
 STAGE_STOCK = "stock"
 STAGE_BOOK = "book"
@@ -53,15 +49,6 @@ CATEGORY_CODE = {v.lower(): k for k, v in CATEGORY_LABEL.items()}
 
 # Finance manager's payment route
 PAYMENT_LABEL = {"ca": "Cash Advance", "ap": "Account Payable"}
-
-
-def local_now():
-    if ZoneInfo:
-        try:
-            return datetime.now(ZoneInfo(Config.TIMEZONE)).replace(tzinfo=None)
-        except Exception:
-            pass
-    return datetime.now()
 
 
 def is_working_time(dt):

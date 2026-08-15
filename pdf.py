@@ -51,13 +51,16 @@ STAGE_LABEL = {
     "gm": "General manager", "board": "Board of director",
     "approved": "Approved", "returned": "Returned to requester",
 }
+# There is no ordering gate -- nobody taps "Ordered", and no ordering_by /
+# ordering_at column exists to fill. Listing it here printed a permanent
+# "Ordering: Pending" line on every approval copy, including closed POs, which
+# reads as a step someone forgot rather than a step that does not exist.
 STAGES = [
     ("Stock controller", "stock"),
     ("Bookkeeping", "book"),
     ("Finance manager", "fin"),
     ("General manager", "gm"),
     ("Board of director", "board"),
-    ("Ordering", "ordering"),
 ]
 
 
@@ -81,8 +84,7 @@ def _approval_rows(po):
         by = str(po.get(f"{code}_by", "")).strip()
         at = str(po.get(f"{code}_at", "")).strip()
         if by:
-            verb = {"stock": "Checked", "book": "Booked",
-                    "ordering": "Ordered"}.get(code, "Approved")
+            verb = {"stock": "Checked", "book": "Booked"}.get(code, "Approved")
             status = f"{verb} by {by}" + (f"  -  {at}" if at else "")
         elif reject_stage == code and reject_reason:
             status = f"Rejected: {reject_reason}"
@@ -179,22 +181,27 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
     if show_prices:
         with pdf.table(
             width=178,
-            col_widths=(9, 27, 20, 34, 14, 10, 14, 25, 25),
-            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "LEFT", "RIGHT",
+            col_widths=(8, 27, 50, 28, 10, 13, 22, 20),
+            text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT",
                         "RIGHT", "RIGHT", "RIGHT"),
             headings_style=headings,
             line_height=7,
             first_row_as_headings=True,
         ) as table:
             head = table.row()
-            for h in ["No", "CML code", "Sup. code", "Item", "Pack", "Qty",
+            # No supplier code here. It is the supplier's own reference and
+            # means nothing to an approver -- it belongs on the copy that is
+            # actually sent out. The ordering group keeps that copy, so the
+            # mapping from a delivery note back to a line is not lost. The
+            # width it frees goes to the item name, which is what an approver
+            # is actually reading.
+            for h in ["No", "CML code", "Item", "Pack", "Qty",
                       "Stock", "Unit price", "Total"]:
                 head.cell(h)
             for i, it in enumerate(items, 1):
                 r = table.row()
                 r.cell(str(i))
                 r.cell(str(it.get("material_code", "")))
-                r.cell(str(it.get("supplier_code", "")))
                 r.cell(str(it.get("item", "")))
                 r.cell(str(it.get("pack", "")))
                 r.cell(str(it.get("qty", "")))
@@ -212,7 +219,7 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 r.cell(price)
                 r.cell(_money(it.get("line_total", 0)))
             tot = table.row()
-            for _ in range(7):
+            for _ in range(6):
                 tot.cell("")
             tot.cell("Total", style=bold)
             tot.cell(_money(po.get("total", 0)), style=bold)

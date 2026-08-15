@@ -206,3 +206,46 @@ def test_before_opening_waits_for_the_same_day():
 
 def test_five_pm_is_outside_working_hours():
     assert _due(2026, 8, 7, 17) == ("Sat 08-Aug 08:00", False)
+
+
+# ---- cancellation (monthly review) ----
+CANCELLED = [
+    {"line_id": "173-1", "material_code": "CMLRE00007", "item": "ALT/GPT",
+     "pack": "1x160mL", "qty": 10, "cancelled_qty": 4},
+    {"line_id": "173-2", "material_code": "CMLRE00010", "item": "ALBUMIN",
+     "pack": "1x250mL", "qty": 4, "cancelled_qty": 4},
+]
+
+
+def test_fully_cancelled_line_drops_out_of_outstanding():
+    """The PO only closes when this map empties. While cancelled_qty was
+    ignored the line stayed here for ever: open, still receivable, and gone
+    from the review list -- which does count cancellations."""
+    o = rv.outstanding_from(CANCELLED, [])
+    assert "CMLRE00010" not in o
+
+
+def test_cancelling_the_remainder_of_a_part_received_line_closes_it():
+    o = rv.outstanding_from(CANCELLED, [{"line_id": "173-1", "qty_received": 6}])
+    assert o == {}
+
+
+def test_cancelled_quantity_is_no_longer_expected():
+    o = rv.outstanding_from(CANCELLED, [])
+    assert o["CMLRE00007"]["ordered"] == 6        # 10 ordered less 4 cancelled
+    assert o["CMLRE00007"]["ordered_gross"] == 10
+    assert o["CMLRE00007"]["cancelled"] == 4
+
+
+def test_receiving_past_the_cancellation_is_flagged_as_over():
+    res = rv.validate(rows(("CMLRE00007", 7, "L1", "15-Mar-2027")),
+                      rv.outstanding_from(CANCELLED, []),
+                      invoice_no="INV-1", today=TODAY)
+    assert statuses(res) == [rv.ST_OVER_RECEIPT]
+    assert "against 6 ordered" in res.report[0]["message"]
+
+
+def test_missing_invoice_number_has_its_own_status():
+    res = run(rows(("CMLRE00007", 1, "L1", "15-Mar-2027")), invoice_no="")
+    assert res.report[-1]["status"] == rv.ST_MISSING_INVOICE
+    assert res.blocked

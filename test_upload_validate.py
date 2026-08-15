@@ -149,3 +149,17 @@ def test_report_covers_every_populated_row_in_sheet_order():
     assert [r["row_no"] for r in res.report] == [8, 9, 10]
     assert res.summary["rows_blocked"] == 1
     assert res.summary["blocked_by_status"] == {uv.STATUS_NOT_FOUND: 1}
+
+
+def test_excluded_count_is_scoped_to_the_template():
+    """A duplicated code is unusable everywhere, but the requester is told how
+    many items are missing from HER file -- not the master list's total."""
+    dup_rows = [
+        {"material_code": "DUP-1", "item": "A", "supplier": "Alpha", "unit_price": 5},
+        {"material_code": "DUP-1", "item": "B", "supplier": "Alpha", "unit_price": 9},
+        {"material_code": "OK-1", "item": "C", "supplier": "Beta", "unit_price": 3},
+    ]
+    idx = uv.build_index(dup_rows, [])
+    assert idx.dup_codes == {"DUP-1"}
+    assert idx.excluded_for(uv.CAT_REAGENT, "Alpha") == 1
+    assert idx.excluded_for(uv.CAT_REAGENT, "Beta") == 0

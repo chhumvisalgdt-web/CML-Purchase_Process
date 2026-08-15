@@ -12,13 +12,14 @@ reader never trusts them: line_id, ordered and received-to-date come from the
 PO and the Receipts tab, not from the file.
 """
 import re
-from datetime import datetime
 from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+
+from clock import local_now
 
 import receipt_validate as rv
 
@@ -112,9 +113,14 @@ def build_receipt_file(po_no, outstanding, out=None):
             no.alignment = Alignment(horizontal="center")
             no.border = BOX
 
+            # 'ordered' here is what is still expected -- gross order less
+            # anything cancelled at the monthly review. Show the cancellation
+            # so the receiver can see why the figure is lower than the PDF.
             ctx = (f"{line['ordered']} ordered"
                    + (f", {line['received']} received"
-                      if line["received"] else ""))
+                      if line["received"] else "")
+                   + (f", {line['cancelled']} cancelled"
+                      if line.get("cancelled") else ""))
             for col, val in ((COL_CODE, code),
                              (COL_ITEM, line["item"] if first else ""),
                              (COL_PACK, line["pack"] if first else ""),
@@ -183,7 +189,7 @@ def build_receipt_file(po_no, outstanding, out=None):
                                 ("data_first", DATA_FIRST),
                                 ("data_last", data_last),
                                 ("generated_at",
-                                 datetime.now().isoformat(timespec="seconds"))],
+                                 local_now().isoformat(timespec="seconds"))],
                                start=1):
         mw.cell(row=i, column=1, value=k)
         mw.cell(row=i, column=2, value=str(v))

@@ -6,13 +6,14 @@ temp file. The parser contract lives at the top and the generator honours it.
 """
 import hashlib
 import re
-from datetime import datetime
 from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+
+from clock import local_now
 
 from upload_validate import (CAT_OTHER, CAT_REAGENT, CATEGORY_LABEL, MAX_LINES,
                              STATUS_OK, norm_code)
@@ -60,7 +61,10 @@ def build_template(index, category, supplier, out_path=None):
     if not master:
         raise ValueError(f"no usable items for {category} / {supplier}")
     n = len(master)
-    excluded = sum(1 for c in index.dup_codes if c)
+    # Only the duplicated codes that belong on THIS template. The old count
+    # was every duplicate in the master, so a supplier with no duplicates at
+    # all was still told that items were unavailable.
+    excluded = index.excluded_for(category, supplier)
     no_price = len(candidates) - n
 
     wb = Workbook()
@@ -93,7 +97,7 @@ def build_template(index, category, supplier, out_path=None):
         ws[ref] = label
         ws[ref].font = Font(name=FONT, size=9, bold=True, color=MUTED)
     ws[META_CELLS["version"]] = TEMPLATE_VERSION
-    ws[META_CELLS["generated"]] = datetime.now().strftime("%d-%b-%Y %H:%M")
+    ws[META_CELLS["generated"]] = local_now().strftime("%d-%b-%Y %H:%M")
     ws[META_CELLS["category"]] = CATEGORY_LABEL[category]
     ws[META_CELLS["supplier"]] = supplier
     for ref in META_CELLS.values():
@@ -258,7 +262,7 @@ def write_report(result, meta, out_path=None):
     t.font = Font(name=FONT, size=14, bold=True, color="187B85")
 
     lines = [
-        f"Checked {datetime.now().strftime('%d-%b-%Y %H:%M')}",
+        f"Checked {local_now().strftime('%d-%b-%Y %H:%M')}",
         f"{s['rows_ok']} ready, {s['rows_blocked']} need fixing "
         f"({s['rows_populated']} lines used of {MAX_LINES})",
         "Nothing has been submitted. Fix the rows marked below in your own file "

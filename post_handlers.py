@@ -27,6 +27,7 @@ import flow
 import receipt_excel as rx
 import receipt_validate as rv
 import side_excel as sx
+from clock import now_str, today
 from config import Config
 from sheets import sheets
 
@@ -37,10 +38,6 @@ XL = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "application/vnd.ms-excel")
 
 
-def now_str():
-    return datetime.now().strftime("%d-%b-%Y %H:%M")
-
-
 def fullname(u):
     n = " ".join(filter(None, [u.first_name, u.last_name])).strip()
     return f"{n} (@{u.username})" if u.username else n
@@ -49,6 +46,28 @@ def fullname(u):
 def _is(chat_id, key):
     want = Config.CHAT_IDS.get(key)
     return want is not None and chat_id == want
+
+
+def _wrong_file(meta, kind, po_no=None):
+    """Every generated side-file carries the PO it was made for in its hidden
+    _meta tab. Check it before writing anything.
+
+    Only ONE request is pending per group at a time, and the stock group runs
+    both stock counts and receipts, so a file that comes back late -- after
+    someone has asked for a different PO -- would otherwise be applied to
+    whatever PO happened to be pending, matched by material code. On the price
+    file that silently rewrites approved unit prices on the wrong order.
+    """
+    got_kind = str(meta.get("kind", "")).strip()
+    if got_kind and got_kind != kind:
+        return (f"That looks like the {got_kind} file, not the {kind} one. "
+                f"Send the file I asked for, or start again.")
+    got_po = str(meta.get("po_no", "")).strip()
+    if po_no is not None and got_po and got_po != str(po_no):
+        return (f"This file was generated for PO #{got_po}, but the request "
+                f"waiting here is for PO #{po_no}. Nothing has been recorded "
+                f"— ask for a fresh file for the PO you mean.")
+    return ""
 
 
 async def _download(doc, context):
@@ -122,8 +141,10 @@ async def _handle_receipt(update, context, data, po_no):
     lines = await asyncio.to_thread(sheets.get_line_items, po_no)
     receipts = await asyncio.to_thread(sheets.get_receipts, po_no)
     outstanding = rv.outstanding_from(lines, receipts)
+    # Expiry and short-dating are judged against the local calendar date, not
+    # the server's -- Phnom Penh is 7 hours ahead of a UTC container.
     res = rv.validate(rows, outstanding, invoice_no=meta["invoice_no"],
-                      invoice_date=meta["invoice_date"])
+                      invoice_date=meta["invoice_date"], today=today())
 
     if res.blocked:
         rep = await asyncio.to_thread(rx.write_report, res, meta)
@@ -257,6 +278,10 @@ async def _handle_stock(update, context, data, po_no):
     if meta.get("error"):
         await update.message.reply_text(meta["error"])
         return
+    wrong = _wrong_file(meta, "stock", po_no)
+    if wrong:
+        await update.message.reply_text(wrong)
+        return
     lines = await asyncio.to_thread(sheets.get_line_items, po_no)
     counts, errs = sx.validate_stock(rows, lines)
     if errs:
@@ -298,6 +323,10 @@ async def _handle_price(update, context, data, po_no):
     rows, meta = await asyncio.to_thread(sx.read_price, data)
     if meta.get("error"):
         await update.message.reply_text(meta["error"])
+        return
+    wrong = _wrong_file(meta, "price", po_no)
+    if wrong:
+        await update.message.reply_text(wrong)
         return
     lines = await asyncio.to_thread(sheets.get_line_items, po_no)
     changes, errs = sx.validate_price(rows, lines)
@@ -358,6 +387,10 @@ async def _handle_cancel(update, context, data):
     rows, meta = await asyncio.to_thread(sx.read_outstanding, data)
     if meta.get("error"):
         await update.message.reply_text(meta["error"])
+        return
+    wrong = _wrong_file(meta, "cancel")
+    if wrong:
+        await update.message.reply_text(wrong)
         return
     open_now = await asyncio.to_thread(sheets.open_lines)
     removals, errs = sx.validate_cancel(rows, open_now)

@@ -10,12 +10,13 @@ ordered quantity and master price are all re-read from the sheet, so an edited
 cell cannot change an outcome.
 """
 import re
-from datetime import datetime
 from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
+
+from clock import local_now
 
 DATA_FIRST = 7
 FONT = "Arial"
@@ -66,7 +67,7 @@ def _sheet(wb, title, headers, widths, note):
     ws["A2"] = note
     ws["A2"].font = Font(name=FONT, size=9, color=MUTED)
     ws.merge_cells(f"A3:{span}3")
-    ws["A3"] = f"Generated {datetime.now():%d-%b-%Y %H:%M}"
+    ws["A3"] = f"Generated {local_now():%d-%b-%Y %H:%M}"
     ws["A3"].font = Font(name=FONT, size=9, italic=True, color=MUTED)
     for i, (h, w) in enumerate(zip(headers, widths), start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -304,7 +305,7 @@ def build_outstanding_file(rows):
         _cell(ws, r, 11, None, editable=True)
         r += 1
     return {"bytes": _finish(wb, ws, {"kind": "cancel", "data_last": r - 1}),
-            "filename": f"Outstanding_{datetime.now():%Y%m%d}.xlsx",
+            "filename": f"Outstanding_{local_now():%Y%m%d}.xlsx",
             "lines": len(rows)}
 
 
