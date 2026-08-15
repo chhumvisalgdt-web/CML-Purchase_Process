@@ -72,6 +72,27 @@ def to_float(value):
         return None
 
 
+def to_units(value):
+    """Tests (or mL, or pieces) in one pack. Positive number, or None.
+
+    None is not 0 and must never become 0: it means 'nobody has said', and the
+    only honest thing to do with an unknown pack size is decline to compare.
+    """
+    v = to_float(value)
+    if v is None or v <= 0:
+        return None
+    return v
+
+
+def per_unit(price, units):
+    """Price for one test. None when either side is unknown -- comparing a
+    25-test box with a 50-test kit on headline price alone points at the wrong
+    supplier, which is the whole reason this exists."""
+    if price is None or units is None or units <= 0:
+        return None
+    return price / units
+
+
 def to_qty(value):
     """Whole number > 0, or None. Accepts 4, '4', 4.0, ' 4 '. Rejects 4.5."""
     if value is None or isinstance(value, bool):
@@ -122,6 +143,20 @@ class MasterIndex:
         return [r for r in self.by_code.values()
                 if r["category"] == category and r["supplier"] == supplier]
 
+    def equivalents(self, code):
+        """Master rows registered as the same thing as `code`, from a DIFFERENT
+        supplier. Equivalence is declared in the master's `Equivalent` column,
+        never guessed from item names: 'DENGUE NS1 Ag (25 Tests)' and 'DENGUE
+        NS1 AG FIA (25 Tests)' are one word apart and are different platforms
+        at very different prices. A wrong equivalence on a price-blind PO stays
+        invisible until reconciliation."""
+        mine = self.by_code.get(norm_code(code))
+        if not mine or not mine.get("equivalent"):
+            return []
+        return [r for r in self.by_code.values()
+                if r.get("equivalent") == mine["equivalent"]
+                and r["supplier"] != mine["supplier"]]
+
     def excluded_for(self, category, supplier):
         """How many duplicated codes would have belonged on THIS template.
         What the requester needs to know is what is missing from the file in
@@ -149,6 +184,11 @@ def build_index(reagent_rows, other_rows):
                 "pack": str(raw.get("pack", "")).strip(),
                 "unit_price": to_float(raw.get("unit_price")),
                 "category": category,
+                # Declared equivalence + how many tests are in a pack. Both
+                # optional: blank means "no equivalent known", which is the
+                # case for most of the list.
+                "equivalent": norm_name(raw.get("equivalent")),
+                "tests_per_pack": to_units(raw.get("tests_per_pack")),
             }
             if code in first_seen:
                 dup.add(code)
@@ -173,6 +213,99 @@ def build_index(reagent_rows, other_rows):
                     cur[sup] = price
     return MasterIndex(by_code=by_code, dup_codes=dup, best_by_item=best,
                        dup_where=dup_where)
+
+
+def cheaper_alternative(code, index):
+    """The single best equivalent from another supplier, judged per test.
+
+    Returns (supplier, diff_pct). diff_pct is None when a pack size is missing
+    on either side -- the supplier is still named, because "someone else sells
+    this" is worth knowing even when the size of the gap is not calculable.
+    (None, None) when no equivalent is registered at all.
+    """
+    mine = index.by_code.get(norm_code(code))
+    if not mine:
+        return None, None
+    our_per = per_unit(mine["unit_price"], mine.get("tests_per_pack"))
+    best = None
+    for a in index.equivalents(code):
+        if a["unit_price"] is None or a["unit_price"] <= 0:
+            continue
+        a_per = per_unit(a["unit_price"], a.get("tests_per_pack"))
+        pct = None
+        if our_per is not None and a_per is not None and our_per > 0:
+            pct = (a_per - our_per) / our_per * 100.0
+        # Rank by the comparable figure where there is one; rows we cannot
+        # compare rank last rather than pretending to be the best offer.
+        rank = (pct is None, pct if pct is not None else 0.0)
+        if best is None or rank < best[0]:
+            best = (rank, a["supplier"], pct)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+def alternatives_for(items, index):
+    """Rows for the 'Also available from another supplier' table on the
+    approver PDF: one per alternative supplier, per PO line that has one.
+
+    Lines with no declared equivalent are simply absent -- the table is a
+    signal, not furniture, and it disappears entirely when there is nothing to
+    say. Where a pack size is missing on either side the row is still shown,
+    with both packs and prices, but `diff_pct` is None: an unnormalised
+    comparison dressed up as a normalised one is worse than no comparison.
+    """
+    out = []
+    for i, it in enumerate(items, 1):
+        code = norm_code(it.get("material_code"))
+        mine = index.by_code.get(code)
+        if not mine:
+            continue
+        alts = index.equivalents(code)
+        if not alts:
+            continue
+        our_price = to_float(it.get("unit_price"))
+        if our_price is None:
+            our_price = mine["unit_price"]
+        our_units = mine.get("tests_per_pack")
+        our_per = per_unit(our_price, our_units)
+
+        # One row per supplier: their best offer, not every pack they sell.
+        best = {}
+        for a in alts:
+            if a["unit_price"] is None or a["unit_price"] <= 0:
+                continue
+            a_per = per_unit(a["unit_price"], a.get("tests_per_pack"))
+            key = a["supplier"]
+            rank = (a_per if a_per is not None else a["unit_price"], a_per is None)
+            if key not in best or rank < best[key][0]:
+                best[key] = (rank, a, a_per)
+
+        qty = to_qty(it.get("qty")) or 0
+        for supplier, (_rank, a, a_per) in best.items():
+            diff_pct = diff_amount = None
+            if our_per is not None and a_per is not None and our_per > 0:
+                diff_pct = (a_per - our_per) / our_per * 100.0
+                if our_units:
+                    diff_amount = (a_per - our_per) * qty * our_units
+            out.append({
+                "no": i,
+                "item": mine["item"] or str(it.get("item", "")),
+                "pack": mine["pack"] or str(it.get("pack", "")),
+                "price": our_price,
+                "alt_supplier": supplier,
+                "alt_item": a["item"],
+                "alt_pack": a["pack"],
+                "alt_price": a["unit_price"],
+                "diff_pct": diff_pct,
+                "diff_amount": diff_amount,
+            })
+    # Cheapest alternative first; rows we could not compare sink to the bottom
+    # rather than sitting among figures that look authoritative.
+    out.sort(key=lambda r: (r["diff_pct"] is None,
+                            r["diff_pct"] if r["diff_pct"] is not None else 0,
+                            r["no"]))
+    return out
 
 
 @dataclass

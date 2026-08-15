@@ -20,7 +20,9 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Default headers used only if we have to auto-create a master tab in the main spreadsheet.
 MASTER_DEFAULT_HEADERS = ["No.", "Material Code", "CML Reagent", "Supplier",
-                          "Supplier Reagent", "Price", "Pack"]
+                          "Supplier Reagent", "Price", "Pack",
+                          "Supplier Material Code", "Equivalent",
+                          "Tests per pack"]
 
 PO_HEADERS = [
     "po_no", "created_at", "requester_id", "requester_name", "supplier",
@@ -216,6 +218,11 @@ class Sheets:
             "sreagent": idx("supplier reagent"),
             "price": idx("price", "unit price"),
             "pack": idx("pack", "unit"),
+            # Optional. Both blank on most rows; the bot ignores a row for
+            # cross-supplier comparison unless BOTH are filled in.
+            "equivalent": idx("equivalent", "equivalent group", "equiv"),
+            "tests_per_pack": idx("tests per pack", "tests/pack",
+                                  "units per pack", "qty per pack"),
         }
         out = []
         for r in rows[1:]:
@@ -233,6 +240,8 @@ class Sheets:
                 "unit_price": _to_float(g("price")),
                 "pack": g("pack"),
                 "category": category,
+                "equivalent": g("equivalent"),
+                "tests_per_pack": g("tests_per_pack"),
             })
         return out
 

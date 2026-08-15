@@ -16,7 +16,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from clock import local_now
 
 from upload_validate import (CAT_OTHER, CAT_REAGENT, CATEGORY_LABEL, MAX_LINES,
-                             STATUS_OK, norm_code)
+                             STATUS_OK, cheaper_alternative, norm_code)
 
 TEMPLATE_VERSION = "1.0"
 SHEET_NAME = "PO Request"
@@ -39,9 +39,14 @@ OK_FILL = PatternFill("solid", fgColor="EAF3DE")
 HAIR = Side(style="thin", color="C9C7BF")
 BOX = Border(left=HAIR, right=HAIR, top=HAIR, bottom=HAIR)
 
+# Columns H and I are APPENDED, never inserted: the reader takes code, qty and
+# note from B, F and G, so a template issued before these columns existed still
+# parses correctly. Inserting would have silently shifted Qty on every file
+# already in circulation.
 HEADERS = ["No.", "Material Code", "Item (auto)", "Supplier (auto)",
-           "Pack (auto)", "Qty", "Note"]
-WIDTHS = [6, 20, 44, 26, 16, 9, 34]
+           "Pack (auto)", "Qty", "Note", "Also sold by (auto)", "Diff (auto)"]
+WIDTHS = [6, 20, 44, 26, 16, 9, 30, 26, 12]
+LAST_COL = "I"
 
 
 def _lookup(code_cell, master_col, n_master):
@@ -71,7 +76,7 @@ def build_template(index, category, supplier, out_path=None):
     ws = wb.active
     ws.title = SHEET_NAME
 
-    ws.merge_cells("A1:G1")
+    ws.merge_cells(f"A1:{LAST_COL}1")
     t = ws["A1"]
     t.value = f"CML purchase order - request template ({CATEGORY_LABEL[category]})"
     t.font = Font(name=FONT, size=14, bold=True, color="187B85")
@@ -84,9 +89,12 @@ def build_template(index, category, supplier, out_path=None):
             f"Maximum {MAX_LINES} line items per order. Need more? Send a second "
             "file - each file becomes its own PO.",
             "Do not add or delete rows, rename the tabs, or edit the Master tab. "
-            "Prices are not shown here and are not needed.")):
+            "No prices appear here. 'Also sold by' names another supplier who "
+            "sells the same item and 'Diff' how theirs compares PER TEST, so a "
+            "bigger pack is not mistaken for a dearer one; blank means nobody "
+            "else is registered for it.")):
         r = 2 + i
-        ws.merge_cells(f"A{r}:G{r}")
+        ws.merge_cells(f"A{r}:{LAST_COL}{r}")
         c = ws[f"A{r}"]
         c.value = text
         c.font = Font(name=FONT, size=9, color=MUTED)
@@ -128,7 +136,8 @@ def build_template(index, category, supplier, out_path=None):
             if col == COL_QTY:
                 c.alignment = Alignment(horizontal="center")
                 c.number_format = "0"
-        for col_i, master_col in ((3, "B"), (4, "C"), (5, "D")):
+        for col_i, master_col in ((3, "B"), (4, "C"), (5, "D"),
+                                  (8, "E"), (9, "F")):
             f = ws.cell(row=r, column=col_i,
                         value=_lookup(f"$B{r}", master_col, n))
             f.font = Font(name=FONT, size=10, color=INK)
@@ -136,7 +145,7 @@ def build_template(index, category, supplier, out_path=None):
             f.border = BOX
 
     guard = DATA_LAST + 1
-    ws.merge_cells(f"A{guard}:G{guard}")
+    ws.merge_cells(f"A{guard}:{LAST_COL}{guard}")
     g = ws[f"A{guard}"]
     g.value = (f"Anything typed below this line is ignored. Only rows "
                f"{DATA_FIRST}-{DATA_LAST} are read.")
@@ -161,17 +170,27 @@ def build_template(index, category, supplier, out_path=None):
     ws.freeze_panes = f"A{DATA_FIRST}"
 
     ms = wb.create_sheet(MASTER_SHEET)
-    for i, head in enumerate(["Material Code", "Item", "Supplier", "Pack"], 1):
+    for i, head in enumerate(["Material Code", "Item", "Supplier", "Pack",
+                              "Also sold by", "Diff"], 1):
         c = ms.cell(row=1, column=i, value=head)
         c.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
         c.fill = HEAD_FILL
-    for i, w in enumerate([20, 44, 26, 16], 1):
+    for i, w in enumerate([20, 44, 26, 16, 26, 12], 1):
         ms.column_dimensions[get_column_letter(i)].width = w
     for r, row in enumerate(master, start=2):
         for col, key in enumerate(("raw_code", "item", "supplier", "pack"), 1):
             c = ms.cell(row=r, column=col, value=row[key])
             c.font = Font(name=FONT, size=10, color=INK)
-    ms.cell(row=1, column=6, value="Reference copy. No prices. Do not edit.").font = \
+        # Who else sells this, and by how much they differ PER TEST. Relative
+        # only: no price of any kind reaches the requester's file, so she can
+        # see that a supplier is dearer without learning what CML pays.
+        alt_supplier, alt_pct = cheaper_alternative(row["material_code"], index)
+        ms.cell(row=r, column=5, value=alt_supplier or "").font = \
+            Font(name=FONT, size=10, color=INK)
+        ms.cell(row=r, column=6,
+                value="" if alt_pct is None else f"{alt_pct:+.0f}%").font = \
+            Font(name=FONT, size=10, color=INK)
+    ms.cell(row=1, column=8, value="Reference copy. No prices. Do not edit.").font = \
         Font(name=FONT, size=9, italic=True, color=MUTED)
     ms.protection.sheet = True
     ms.freeze_panes = "A2"

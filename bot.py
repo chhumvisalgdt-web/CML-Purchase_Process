@@ -18,6 +18,7 @@ from config import Config
 from sheets import sheets
 from pdf import generate_po_pdf, ensure_fonts
 import flow
+import upload_validate
 import upload_handlers
 import post_handlers
 import group_handlers
@@ -87,6 +88,24 @@ async def _send_pdf(context, chat_id, pdf, filename, caption, parse, reply_marku
     raise last
 
 
+async def _alternatives(items, show_prices=True):
+    """Cross-supplier equivalents for the approver PDF.
+
+    Best-effort: if the master list cannot be read the PO still goes out, just
+    without the table. A missing comparison is a smaller problem than a PO
+    that never reaches the group that has to approve it.
+    """
+    if not show_prices or not items:
+        return []
+    try:
+        index = await upload_handlers.master_index()
+        return await asyncio.to_thread(
+            upload_validate.alternatives_for, items, index)
+    except Exception as e:
+        log.warning("Could not build the alternatives table: %s", e)
+        return []
+
+
 async def post_stage(context, po_no):
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if not po:
@@ -108,8 +127,10 @@ async def post_stage(context, po_no):
                            show_prices=(stage != flow.STAGE_STOCK))
     caption, parse = _html_caption(text)
     kb = flow.action_keyboard(stage, po_no)
+    show = stage != flow.STAGE_STOCK
+    alts = await _alternatives(items, show)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items,
-                                  show_prices=(stage != flow.STAGE_STOCK))
+                                  show_prices=show, alternatives=alts)
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{stage}.pdf", caption, parse, kb)
 
 
@@ -122,7 +143,9 @@ async def notify_group(context, po_no, chat_key, header, show_prices=True):
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
     text = flow.po_summary(po, items, header=header, show_prices=show_prices)
     caption, parse = _html_caption(text)
-    pdf = await asyncio.to_thread(generate_po_pdf, po, items, show_prices=show_prices)
+    alts = await _alternatives(items, show_prices)
+    pdf = await asyncio.to_thread(generate_po_pdf, po, items,
+                                  show_prices=show_prices, alternatives=alts)
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{chat_key}.pdf", caption, parse)
 
 
@@ -189,7 +212,8 @@ async def _post_approved(context, po_no, po):
                                     supplier_copy=True)
     await _send_pdf(context, chat_id, order, f"PO_{po_no}.pdf", caption, parse)
 
-    approval = await asyncio.to_thread(generate_po_pdf, po, items)
+    approval = await asyncio.to_thread(generate_po_pdf, po, items,
+                                       alternatives=await _alternatives(items))
     try:
         await context.bot.send_document(
             chat_id=chat_id, document=approval,

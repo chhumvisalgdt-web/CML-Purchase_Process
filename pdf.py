@@ -98,10 +98,17 @@ def _approval_rows(po):
     return rows
 
 
-def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
+def generate_po_pdf(po, items, supplier_copy=False, show_prices=True,
+                    alternatives=None):
     """show_prices=False renders a price-blind PDF (No/Code/Item/Pack/Qty only, no totals,
     no price-change note) — used for the Stock controller stage. The supplier copy always
-    includes prices (it is the order document)."""
+    includes prices (it is the order document).
+
+    alternatives: rows from upload_validate.alternatives_for(), printed under
+    the order table on price-visible copies so Finance, the GM and the Board
+    can see the same item is sold by someone else. Omit or pass [] and the
+    section does not appear at all.
+    """
     ensure_fonts()
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_margins(16, 16, 16)
@@ -179,13 +186,18 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
         return BytesIO(bytes(pdf.output()))
 
     if show_prices:
+        # Size 10, not 11: at 11 only two of your ten rapid-test names fit on
+        # one line. The width for Item comes mostly out of Pack, which is free
+        # -- the packs long enough to wrap (1x800+1x200mL) belong to reagents
+        # whose names already force a second line on that row.
+        pdf.set_font(FONT, "", 10)
         with pdf.table(
             width=178,
-            col_widths=(8, 27, 50, 28, 10, 13, 22, 20),
+            col_widths=(9, 26, 64, 18, 10, 13, 19, 19),
             text_align=("CENTER", "LEFT", "LEFT", "LEFT", "RIGHT",
                         "RIGHT", "RIGHT", "RIGHT"),
             headings_style=headings,
-            line_height=7,
+            line_height=6.5,
             first_row_as_headings=True,
         ) as table:
             head = table.row()
@@ -209,29 +221,39 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 # whether the quantity is reasonable -- it has to appear on
                 # THEIR copy, not only the stock controller's.
                 r.cell(str(it.get("on_hand", "") or "-"))
-                d = _flow.price_drift(it)
-                price = _money(it.get("unit_price", 0))
-                if d:
-                    ref, _u, pct, flagged = d
-                    price += (f"\n(was {_money(ref)}"
-                              + (f", {pct:+.0f}%" if pct is not None else "")
-                              + (" <<" if flagged else "") + ")")
-                r.cell(price)
+                # The price-change note used to be appended inside this cell.
+                # It needs 41mm on one line and the column is 19 -- it broke
+                # into "(was" / "$12.00," / "+28%" whatever the width. It is
+                # printed under the table instead, one line per changed price.
+                r.cell(_money(it.get("unit_price", 0)))
                 r.cell(_money(it.get("line_total", 0)))
             tot = table.row()
             for _ in range(6):
                 tot.cell("")
             tot.cell("Total", style=bold)
             tot.cell(_money(po.get("total", 0)), style=bold)
-        if any(_flow.price_drift(it) for it in items):
+        drifted = [(i, it, _flow.price_drift(it))
+                   for i, it in enumerate(items, 1)]
+        drifted = [(i, it, d) for i, it, d in drifted if d]
+        if drifted:
             pdf.ln(2)
             pdf.set_font(FONT, "", 9)
             pdf.set_text_color(*ORANGE)
-            pdf.cell(0, 5,
-                     "Prices marked (was ...) were confirmed with the supplier "
-                     "and differ from the master list;  <<  marks a change of "
-                     f"+/-{Config.OTHER_PRICE_TOLERANCE_PCT:.0f}% or more.",
-                     new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(
+                178, 4.6,
+                "Prices confirmed with the supplier that differ from the master "
+                f"list;  <<  marks a change of +/-"
+                f"{Config.OTHER_PRICE_TOLERANCE_PCT:.0f}% or more.",
+                new_x="LMARGIN", new_y="NEXT")
+            for i, it, d in drifted:
+                ref, unit, pct, flagged = d
+                line = (f"Line {i}  {str(it.get('item', ''))}: confirmed at "
+                        f"{_money(unit)}, master price {_money(ref)}")
+                if pct is not None:
+                    line += f"  ({pct:+.0f}%)"
+                if flagged:
+                    line += "  <<"
+                pdf.multi_cell(178, 4.6, line, new_x="LMARGIN", new_y="NEXT")
             pdf.set_text_color(0, 0, 0)
     else:
         with pdf.table(
@@ -253,6 +275,77 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True):
                 r.cell(str(it.get("pack", "")))
                 r.cell(str(it.get("qty", "")))
                 r.cell(str(it.get("on_hand", "") or "-"))
+
+    # ---------- also available from another supplier ----------
+    # Price-visible copies only. The requester and the stock controller never
+    # see it: the whole flow depends on them not choosing on price.
+    if show_prices and alternatives:
+        pdf.ln(6)
+        pdf.set_font(FONT, "", 12)
+        pdf.set_text_color(*TEAL)
+        pdf.cell(0, 7, "Also available from another supplier",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(FONT, "", 8)
+        pdf.set_text_color(*GREY)
+        pdf.multi_cell(
+            178, 4.2,
+            "The same item is registered in the master list under another "
+            "supplier. A PO covers one supplier only, so changing supplier "
+            "means rejecting this request and raising a new one.",
+            new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font(FONT, "", 9)
+        with pdf.table(
+            width=178,
+            col_widths=(9, 46, 20, 18, 33, 20, 18, 14),
+            text_align=("CENTER", "LEFT", "LEFT", "RIGHT", "LEFT", "LEFT",
+                        "RIGHT", "RIGHT"),
+            headings_style=headings,
+            line_height=5.5,
+            first_row_as_headings=True,
+        ) as table:
+            head = table.row()
+            for h in ["No", "Item", "Pack", "Price", "Alternative supplier",
+                      "Pack", "Price", "Diff"]:
+                head.cell(h)
+            for a in alternatives:
+                r = table.row()
+                r.cell(str(a.get("no", "")))
+                r.cell(str(a.get("item", "")))
+                r.cell(str(a.get("pack", "")))
+                r.cell(_money(a.get("price", 0)))
+                r.cell(str(a.get("alt_supplier", "")))
+                r.cell(str(a.get("alt_pack", "")))
+                r.cell(_money(a.get("alt_price", 0)))
+                # No pack size on one side means no honest comparison. A dash
+                # says so; a percentage worked out from headline prices would
+                # point at the wrong supplier whenever the packs differ.
+                pct = a.get("diff_pct")
+                r.cell("-" if pct is None else f"{pct:+.0f}%")
+        pdf.ln(2)
+        pdf.set_font(FONT, "", 8)
+        pdf.set_text_color(*ORANGE)
+        pdf.multi_cell(
+            178, 4.2,
+            "Diff compares price PER TEST, not per pack - pack sizes differ "
+            "between suppliers. A dash means a pack size is missing from the "
+            "master list, so the two cannot be compared.",
+            new_x="LMARGIN", new_y="NEXT")
+        amounts = [a["diff_amount"] for a in alternatives
+                   if a.get("diff_amount") is not None]
+        lines_with_alt = len({a.get("no") for a in alternatives})
+        pdf.set_text_color(*GREY)
+        summary = (f"{lines_with_alt} of {len(items)} line(s) have an "
+                   f"alternative supplier.")
+        if amounts:
+            total = sum(amounts)
+            summary += (f" At the quantities ordered the difference is about "
+                        f"{_money(abs(total))} "
+                        f"{'less' if total < 0 else 'more'} - indicative only, "
+                        f"since pack sizes do not divide evenly.")
+        pdf.multi_cell(178, 4.2, summary, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
 
     # ---------- PAGE 2: approval (internal) ----------
     pdf.add_page()

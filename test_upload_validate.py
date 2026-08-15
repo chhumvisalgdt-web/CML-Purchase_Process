@@ -163,3 +163,89 @@ def test_excluded_count_is_scoped_to_the_template():
     assert idx.dup_codes == {"DUP-1"}
     assert idx.excluded_for(uv.CAT_REAGENT, "Alpha") == 1
     assert idx.excluded_for(uv.CAT_REAGENT, "Beta") == 0
+
+
+# ---- cross-supplier alternatives ----
+ALT_MASTER = [
+    {"material_code": "CMLRE00016", "item": "HBs Ag (25 Tests)",
+     "supplier": "B Scientific", "unit_price": 15.40, "pack": "25 Tests",
+     "equivalent": "HBSAG-RAPID", "tests_per_pack": 25},
+    {"material_code": "CMLRE00300", "item": "HBsAg Rapid Test 50/Kit",
+     "supplier": "Borey Pharma", "unit_price": 18.50, "pack": "50/Kit",
+     "equivalent": "HBSAG-RAPID", "tests_per_pack": 50},
+    {"material_code": "CMLRE00301", "item": "HBsAg Rapid Test 40/Kit",
+     "supplier": "Borey Pharma", "unit_price": 18.50, "pack": "40/Kit",
+     "equivalent": "HBSAG-RAPID", "tests_per_pack": 40},
+    {"material_code": "CMLRE00011", "item": "CHIKUNGUNYA IgM/IgG (25 Tests)",
+     "supplier": "B Scientific", "unit_price": 83.60, "pack": "25 Tests",
+     "equivalent": "", "tests_per_pack": 25},
+    {"material_code": "CMLRE00099", "item": "MYSTERY KIT",
+     "supplier": "B Scientific", "unit_price": 10.0, "pack": "Box",
+     "equivalent": "MYSTERY", "tests_per_pack": ""},
+    {"material_code": "CMLRE00098", "item": "MYSTERY KIT (other)",
+     "supplier": "Borey Pharma", "unit_price": 9.0, "pack": "Box",
+     "equivalent": "MYSTERY", "tests_per_pack": ""},
+]
+ALT_IDX = uv.build_index(ALT_MASTER, [])
+
+
+def _alts(codes_qty):
+    items = [{"material_code": c, "qty": q, "unit_price": None} for c, q in codes_qty]
+    for it in items:
+        it["unit_price"] = ALT_IDX.by_code[it["material_code"]]["unit_price"]
+    return uv.alternatives_for(items, ALT_IDX)
+
+
+def test_line_without_an_equivalent_is_absent():
+    """The table is a signal, not furniture -- a line with no alternative does
+    not appear, and a PO with none at all produces no table."""
+    assert _alts([("CMLRE00011", 1)]) == []
+
+
+def test_one_row_per_supplier_not_per_pack():
+    """Borey sells the same test as a 40 and a 50 kit. Listing both would push
+    the reader to compare Borey with Borey."""
+    rows = _alts([("CMLRE00016", 4)])
+    assert len(rows) == 1
+    assert rows[0]["alt_supplier"] == "Borey Pharma"
+    assert rows[0]["alt_pack"] == "50/Kit"          # their better per-test offer
+
+
+def test_diff_is_per_test_not_per_pack():
+    """$15.40/25 = $0.616 against $18.50/50 = $0.370. On headline price the
+    alternative looks 20% DEARER; per test it is 40% cheaper."""
+    r = _alts([("CMLRE00016", 4)])[0]
+    assert r["price"] == 15.40 and r["alt_price"] == 18.50
+    assert round(r["diff_pct"]) == -40
+    assert round(r["diff_amount"], 2) == -24.60     # 4 packs x 25 tests
+
+
+def test_missing_pack_size_gives_no_percentage():
+    """Rather than compare raw prices and present it as normalised."""
+    r = _alts([("CMLRE00099", 1)])[0]
+    assert r["diff_pct"] is None and r["diff_amount"] is None
+    assert r["alt_price"] == 9.0                    # both prices still shown
+
+
+def test_dearer_alternative_is_shown_as_positive():
+    """So the table also confirms a choice that was already right."""
+    r = _alts([("CMLRE00300", 1)])[0]
+    assert r["diff_pct"] > 0
+
+
+def test_cheaper_alternative_names_supplier_and_percentage():
+    """What the requester's template shows: who else sells it, and by how much
+    they differ per test. Relative only - no price reaches her file."""
+    sup, pct = uv.cheaper_alternative("CMLRE00016", ALT_IDX)
+    assert sup == "Borey Pharma" and round(pct) == -40
+
+
+def test_no_equivalent_gives_no_supplier():
+    assert uv.cheaper_alternative("CMLRE00011", ALT_IDX) == (None, None)
+
+
+def test_alternative_named_even_when_pack_size_unknown():
+    """'Someone else sells this' is worth knowing even when the gap cannot be
+    calculated. The supplier is named; the percentage stays blank."""
+    sup, pct = uv.cheaper_alternative("CMLRE00099", ALT_IDX)
+    assert sup == "Borey Pharma" and pct is None
