@@ -5,8 +5,8 @@ A Telegram bot that runs the CML purchase-order approval flow and stores everyth
 ## Flow
 
 1. **Requester** (DM) — `/new`, then either upload a filled template or ask for a blank one (Reagent or Other). The bot validates the file, shows a preview, and only then asks for the reason and the urgent flag.
-2. **Stock controller** (group) — the PO arrives as an Excel count file; filling in `On hand` and sending it back is the check, and passes it to Bookkeeping. Or Reject.
-3. **Bookkeeping** (group) — books in QBO, taps Booked / Reject.
+2. **Stock controller** (group) — the PO arrives as an Excel count file; filling in `On hand` and sending it back is the check, and passes it to Bookkeeping. This stage cannot reject.
+3. **Bookkeeping** (group) — books in QBO, taps Booked. This stage cannot reject.
 4. **Finance manager** (group) — approves and picks the payment route: **Cash Advance** or **A/P**, or rejects.
 5. Then it branches:
    - **Not urgent** → General manager → Board of director → Approved.
@@ -85,6 +85,8 @@ Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00
 `/outstanding` in the Finance group lists every open line across all POs with a `Remove?` column. Removal cancels **only the un-received remainder** — a line at 6-of-10 cancels 4 and stays at 6 received. Lines are marked cancelled with a mandatory reason, never deleted: deleting would erase the evidence that the item was ever ordered.
 
 A cancelled quantity stops being expected everywhere at once: it drops off the receipt file, the 7th unit against a 10-line with 4 cancelled is flagged as over-receipt, and a PO whose whole remainder is cancelled closes. There is one definition of "still owed" — `ordered − cancelled − received` — and the review list and the receiving path both use it.
+
+**Only the Finance manager, the GM and the Board can reject.** Rejecting is a spending decision, and the two stages below Finance are not spending roles — the stock controller is price-blind and counts the shelf, bookkeeping confirms a price and books it. "We already have plenty" belongs in the stock count, where the price-visible approvers can see the number, rather than in a veto that removes the evidence and settles the question before they ever see it.
 
 Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier copy); page 2 is the internal approval trail. A reject at any stage returns the PO to the requester with the reason; after they fix it, the PO **re-runs from the Stock controller** with every earlier sign-off cleared.
 

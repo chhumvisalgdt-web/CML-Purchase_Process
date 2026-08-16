@@ -283,13 +283,31 @@ def test_generated_files_route_themselves():
     assert ph._peek(b"not a workbook") == ("", "")
 
 
-def test_stock_stage_has_no_checked_button():
-    """The returned file is the check; a button afterwards recorded only that
-    somebody pressed a button."""
+def test_stock_stage_has_no_buttons_at_all():
+    """The returned file is the check, and this stage cannot reject, so there
+    is nothing left to tap."""
     import flow
-    labels = [b.text for row in flow.action_keyboard("stock", 1).inline_keyboard
-              for b in row]
-    assert labels == ["❌ Reject"]
+    assert flow.action_keyboard("stock", 1) is None
+
+
+def test_only_finance_and_above_can_reject():
+    import flow
+    assert not flow.can_reject("stock")
+    assert not flow.can_reject("book")
+    assert all(flow.can_reject(s) for s in ("fin", "gm", "board"))
+
+
+def test_no_reject_button_below_finance():
+    """A button that is not there cannot be pressed -- but old cards still
+    carry one, which is why bot._cb_action re-checks."""
+    import flow
+    book = [b.text for row in flow.action_keyboard("book", 1).inline_keyboard
+            for b in row]
+    assert "\u274c Reject" not in book and "\u2705 Booked" in book
+    for st in ("fin", "gm", "board"):
+        labels = [b.text for row in flow.action_keyboard(st, 1).inline_keyboard
+                  for b in row]
+        assert "\u274c Reject" in labels
 
 
 # ---- rejection reasons ----

@@ -37,8 +37,10 @@ GROUP_CARDS = {
             "column and send it back \u2014 that records the count and passes "
             "the PO to Bookkeeping. Enter <code>#N/A</code> where you cannot "
             "count, and <code>0</code> where there is none.",
-            "To stop a PO instead, tap <b>Reject</b> and reply with the reason. "
             "Lost the file? Send <code>/stock &lt;PO number&gt;</code>.",
+            "Only the Finance manager and above can send a PO back. If the "
+            "request looks wrong, record the count anyway and say so in this "
+            "group \u2014 the number is what lets them judge it.",
             "You are told when a PO is approved. When the goods arrive, send "
             "<code>/receive &lt;PO number&gt;</code>. "
             "The bot sends a file with only the lines still outstanding.",
@@ -59,7 +61,8 @@ GROUP_CARDS = {
             "supplier confirmed. Leave a line blank to keep the master price.",
             "Any change is flagged to Finance, GM and the Board, so they "
             "approve the real figure.",
-            "Create the QBO purchase order, then tap <b>Booked</b>.",
+            "Create the QBO purchase order, then tap <b>Booked</b>. Only the "
+            "Finance manager and above can send a PO back.",
         ],
         "cmds": [("/mypos", "POs you raised"), ("/chatid", "this group's ID")],
     },

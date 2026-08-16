@@ -373,6 +373,17 @@ async def on_callback(update, context):
     # before it could strip the stale buttons.
     if not data.startswith("a:"):
         await q.answer()
+        # Every branch below replies with a NEW message carrying the next step,
+        # so the keyboard just tapped is stale the moment it is used. Left in
+        # place it invites a second tap: "Confirm & send" still sitting under a
+        # PO that was already created reads as if the send had not happened.
+        # The approval path is excluded -- _ack_edit clears those, and a Reject
+        # awaiting its reason deliberately keeps its buttons live so the PO can
+        # still be acted on if no reason ever comes.
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     if data == "submit":
         await _cb_submit(q, context)
     elif data.startswith("u:"):
@@ -573,6 +584,18 @@ async def _cb_action(q, context, data):
     if allowed and user.id not in allowed:
         await q.answer("You're not authorized to act on this stage.", show_alert=True)
         return
+    # Checked here as well as in the keyboard: PO cards posted before this
+    # change still carry a live Reject button, and a stale button that still
+    # works is not a removed permission.
+    if act == "no" and not flow.can_reject(stage):
+        await q.answer(
+            "Only the Finance manager and above can send a PO back. Record "
+            "what you found and let it go forward.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if not po:
         await q.answer("PO not found.", show_alert=True)
@@ -590,8 +613,8 @@ async def _cb_action(q, context, data):
             items = await asyncio.to_thread(sheets.get_line_items, po_no)
             if any(not str(it.get("on_hand", "")).strip() for it in items):
                 await q.answer(
-                    "Enter the stock on hand first \u2014 tap "
-                    "'Enter stock on hand'.", show_alert=True)
+                    "Fill in the On hand column and send the count file back "
+                    "\u2014 that is the check.", show_alert=True)
                 return
         await q.answer()
         by_col, at_col = flow.STAGE_AUDIT.get(stage, ("", ""))

@@ -122,6 +122,19 @@ def next_stage(stage, urgent):
     return STAGE_CLOSED
 
 
+# Who may send a PO back to the requester. Rejecting is a spending decision,
+# and the two stages below it are not spending roles: the stock controller is
+# price-blind and counts the shelf, bookkeeping confirms a price and books it.
+# "We already have plenty" belongs in the count, where Finance, the GM and the
+# Board can see the number -- not in a veto that removes the evidence and
+# quietly moves the decision to someone who cannot see prices.
+REJECT_STAGES = (STAGE_FIN, STAGE_GM, STAGE_BOARD)
+
+
+def can_reject(stage):
+    return stage in REJECT_STAGES
+
+
 # Stages that hold an approval decision. Receiving is execution, not approval:
 # it cannot reject a PO back to the requester, only report a discrepancy, so it
 # is deliberately absent here.
@@ -146,18 +159,12 @@ def action_keyboard(stage, po_no):
             [InlineKeyboardButton("\U0001f4b2 Confirm / update prices",
                                   callback_data=f"bk:price:{po_no}")],
             [InlineKeyboardButton("\u2705 Booked",
-                                  callback_data=f"a:book:booked:{po_no}"),
-             InlineKeyboardButton("\u274c Reject",
-                                  callback_data=f"a:book:no:{po_no}")],
+                                  callback_data=f"a:book:booked:{po_no}")],
         ])
     if stage == STAGE_STOCK:
-        # No "Checked" button: returning the completed count file IS the check,
-        # signed by whoever filled it in. A separate tap only ever recorded
-        # that someone pressed a button afterwards.
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("\u274c Reject",
-                                  callback_data=f"a:stock:no:{po_no}")],
-        ])
+        # No buttons at all. Returning the completed count file IS the check,
+        # and this stage cannot reject, so there is nothing left to tap.
+        return None
     if stage == STAGE_FIN:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("\u2705 Approve \u00b7 Cash Advance", callback_data=f"a:fin:ca:{po_no}")],
