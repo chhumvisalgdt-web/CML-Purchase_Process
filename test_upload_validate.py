@@ -249,3 +249,102 @@ def test_alternative_named_even_when_pack_size_unknown():
     calculated. The supplier is named; the percentage stays blank."""
     sup, pct = uv.cheaper_alternative("CMLRE00099", ALT_IDX)
     assert sup == "Borey Pharma" and pct is None
+
+
+def test_zero_is_a_real_answer_not_a_blank():
+    """Excel hands back the integer 0, and `str(v or "")` collapsed it to "".
+    Zero on hand is the strongest argument FOR an order, so losing it is the
+    worst possible value to lose."""
+    import side_excel as sx
+    lines = [{"line_id": "1-1", "material_code": "C1", "item": "Reagent", "qty": 1}]
+    counts, errs = sx.validate_stock([{"row_no": 7, "code": "C1", "on_hand": 0}], lines)
+    assert not errs and counts[0]["on_hand"] == 0
+    # a genuinely empty cell must still be rejected
+    _, errs2 = sx.validate_stock([{"row_no": 7, "code": "C1", "on_hand": None}], lines)
+    assert errs2
+
+
+def test_lone_zero_quantity_is_reported_not_skipped():
+    idx = uv.build_index(
+        [{"material_code": "C1", "item": "X", "supplier": "S", "unit_price": 1.0}], [])
+    res = uv.validate([{"row_no": 8, "code": None, "qty": 0, "note": None}], idx)
+    assert res.summary["rows_populated"] == 1
+
+
+def test_generated_files_route_themselves():
+    """Each file carries its own kind and PO number, so two POs arriving in a
+    row cannot leave the first one's file unroutable."""
+    import side_excel as sx, post_handlers as ph
+    lines = [{"line_id": "190-1", "material_code": "C1", "item": "X",
+              "pack": "100 T", "qty": 1}]
+    assert ph._peek(sx.build_stock_file(190, lines)["bytes"]) == ("stock", "190")
+    assert ph._peek(sx.build_price_file(191, lines)["bytes"]) == ("price", "191")
+    # a file with no _meta at all falls back to the group's pending request
+    assert ph._peek(b"not a workbook") == ("", "")
+
+
+def test_stock_stage_has_no_checked_button():
+    """The returned file is the check; a button afterwards recorded only that
+    somebody pressed a button."""
+    import flow
+    labels = [b.text for row in flow.action_keyboard("stock", 1).inline_keyboard
+              for b in row]
+    assert labels == ["❌ Reject"]
+
+
+# ---- rejection reasons ----
+import os as _o
+_o.environ.setdefault("BOT_TOKEN", "1:x"); _o.environ.setdefault("SPREADSHEET_ID", "x")
+_o.environ.setdefault("GOOGLE_CREDENTIALS_JSON", "{}")
+import bot as _bot  # noqa: E402
+
+NOW = 1_000_000.0
+PEND_A = {101: {"po_no": "190", "user_id": 7, "stage": "fin", "card_id": 1,
+                "at": NOW}}
+PEND_TWO = {101: {"po_no": "190", "user_id": 7, "stage": "fin", "card_id": 1,
+                  "at": NOW},
+            102: {"po_no": "191", "user_id": 7, "stage": "fin", "card_id": 2,
+                  "at": NOW}}
+STALE = {101: {"po_no": "190", "user_id": 7, "stage": "fin", "card_id": 1,
+               "at": NOW - 7 * 24 * 3600}}
+
+
+def test_one_outstanding_rejection_needs_no_reply():
+    k, e, err = _bot.pick_rejection(PEND_A, 7, None, now=NOW)
+    assert e["po_no"] == "190" and not err
+
+
+def test_reply_selects_the_right_po():
+    _, e, err = _bot.pick_rejection(PEND_TWO, 7, 102, now=NOW)
+    assert e["po_no"] == "191" and not err
+
+
+def test_two_outstanding_without_a_reply_refuses_to_guess():
+    """Filing the reason against the wrong PO is worse than asking again."""
+    k, e, err = _bot.pick_rejection(PEND_TWO, 7, None, now=NOW)
+    assert e is None and "#190" in err and "#191" in err
+
+
+def test_someone_elses_message_is_ignored():
+    assert _bot.pick_rejection(PEND_A, 99, None, now=NOW) == (None, None, "")
+
+
+def test_a_second_rejection_does_not_evict_the_first():
+    """One slot per group meant the second Reject discarded the first, parking
+    that PO at its stage with no record anyone had tried."""
+    assert len(PEND_TWO) == 2
+    for uid_entry in PEND_TWO.values():
+        assert uid_entry["po_no"] in ("190", "191")
+
+
+def test_a_stale_prompt_needs_a_real_reply():
+    """A week-old Reject that was never answered must not swallow an unrelated
+    message as its reason."""
+    _, e, err = _bot.pick_rejection(STALE, 7, None, now=NOW)
+    assert e is None and "been open a while" in err
+
+
+def test_replying_to_a_stale_prompt_still_works():
+    """The boss is entitled to take his time; he just has to point at it."""
+    _, e, err = _bot.pick_rejection(STALE, 7, 101, now=NOW)
+    assert e["po_no"] == "190" and not err

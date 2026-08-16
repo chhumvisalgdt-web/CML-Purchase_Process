@@ -3,6 +3,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -17,6 +18,7 @@ from clock import now_str
 from config import Config
 from sheets import sheets
 from pdf import generate_po_pdf, ensure_fonts
+import side_excel
 import flow
 import upload_validate
 import upload_handlers
@@ -127,7 +129,22 @@ async def post_stage(context, po_no):
                            show_prices=(stage != flow.STAGE_STOCK))
     caption, parse = _html_caption(text)
     kb = flow.action_keyboard(stage, po_no)
-    show = stage != flow.STAGE_STOCK
+
+    if stage == flow.STAGE_STOCK:
+        # The stock controller gets the file he has to fill in, not a PDF of
+        # it. The count file already lists code, item, pack and quantity
+        # requested, so a read-only copy of the same thing alongside it was
+        # one document too many -- and sending it as a PDF meant the work
+        # could not start from the message it arrived in.
+        built = await asyncio.to_thread(side_excel.build_stock_file, po_no, items)
+        caption = (caption + "\n\nFill in On hand and send this file back. "
+                   "That records the count and passes the PO to Bookkeeping. "
+                   "Enter #N/A where you cannot count.")[:1024]
+        await _send_pdf(context, chat_id, built["bytes"], built["filename"],
+                        caption, None, kb)
+        return
+
+    show = True
     alts = await _alternatives(items, show)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items,
                                   show_prices=show, alternatives=alts)
@@ -173,17 +190,6 @@ async def finalize(context, po_no):
         log.warning("Could not DM requester on approval: %s", e)
 
 
-def _missing_supplier_codes(items):
-    """Lines with no supplier code in column H.
-
-    Nothing is blocked -- the supplier's own item name is usually enough to
-    fill an order -- but the approved-PO card says how many lines rest on the
-    name alone, because those are the ones that come back wrong.
-    """
-    return [it for it in items
-            if not str(it.get("supplier_code", "")).strip()]
-
-
 async def _post_approved(context, po_no, po):
     """Two clearly-named PDFs, so nobody has to work out which one is safe to
     forward. The order carries the supplier's own codes and item names and no
@@ -194,18 +200,13 @@ async def _post_approved(context, po_no, po):
         log.error("No approved-PO chat id configured (PO %s)", po_no)
         return
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
-    missing = _missing_supplier_codes(items)
 
+    # No sending-window note and no supplier-code warning on this card. Both
+    # are still recorded: order_due sits on the PO row and prints on PDF page 2
+    # as "Send to supplier", and a blank column H is visible on the order
+    # itself. Repeating them here just pushed the order further down the phone.
     header = "\u2705 Approved \u2014 forward the order PDF to the supplier"
     text = flow.po_summary(po, items, header=header)
-    note = str(po.get("order_due_note", "")).strip()
-    if note == "send today":
-        text += "\n\n\U0001f4e4 Send to the supplier today."
-    elif note:
-        text += f"\n\n\U0001f552 {note}."
-    if missing:
-        text += (f"\n\n\u26a0\ufe0f {len(missing)} line(s) have no supplier "
-                 f"code; they are identified by the supplier's item name only.")
     caption, parse = _html_caption(text)
 
     order = await asyncio.to_thread(generate_po_pdf, po, items,
@@ -318,9 +319,7 @@ async def on_text(update, context):
         await _maybe_capture_reason(update, context)
         return
     state = context.user_data.get("state")
-    if state == "supplier_why":
-        await upload_handlers.handle_supplier_why(update, context)
-    elif state == "reason":
+    if state == "reason":
         await _handle_po_reason(update, context)
     elif state == "editqty":
         await _handle_edit_qty(update, context)
@@ -638,12 +637,41 @@ async def _cb_action(q, context, data):
                 f"Now at: {flow.STAGE_LABEL.get(landed, landed)}.")
     elif act == "no":
         await q.answer()
-        context.chat_data["await_reason"] = {
-            "po_no": po_no, "user_id": user.id, "stage": stage, "msg_id": q.message.message_id,
-        }
-        await q.message.reply_text(
-            f"{fullname(user)}, *reply to this message* with the reason for rejecting PO #{po_no}.",
+        prompt = await q.message.reply_text(
+            f"{fullname(user)}, *reply to this message* with the reason for "
+            f"rejecting PO #{po_no}.\n\nNothing is rejected until you do.",
             parse_mode=ParseMode.MARKDOWN)
+        # Keyed by the prompt's own message id, so two rejections can be
+        # outstanding in one group at once. A single slot meant the second
+        # Reject silently discarded the first, leaving that PO parked at its
+        # stage with no record that anyone had tried to reject it.
+        context.chat_data.setdefault("await_reason", {})[prompt.message_id] = {
+            "po_no": po_no, "user_id": user.id, "stage": stage,
+            "card_id": q.message.message_id, "at": time.time(),
+        }
+
+
+async def stock_checked(context, po_no, user):
+    """Called when the completed count file comes back: the upload is the
+    check. Returns a status string for the reply.
+
+    Guarded the same way the button was -- a file returned for a PO that has
+    already moved on records the count but must not shove the PO forward a
+    second time.
+    """
+    po = await asyncio.to_thread(sheets.get_po, po_no)
+    if not po:
+        return "missing"
+    if str(po.get("stage", "")) != flow.STAGE_STOCK or str(po.get("status", "")) != "active":
+        return "moved"
+    await asyncio.to_thread(sheets.update_po, po_no,
+                            stock_by=fullname(user), stock_at=now_str(),
+                            updated_at=now_str())
+    nxt = flow.next_stage(flow.STAGE_STOCK, flow.is_urgent(po))
+    await asyncio.to_thread(sheets.update_po, po_no, stage=nxt,
+                            updated_at=now_str())
+    await post_stage(context, po_no)
+    return "advanced"
 
 
 async def _tell_finance(context, text):
@@ -670,13 +698,67 @@ async def _tell_stock_to_receive(context, po_no):
         log.warning("Could not notify stock group: %s", e)
 
 
+MIN_REASON_CHARS = 3
+# How long a Reject prompt will accept a plain message as its answer. After
+# that only a real reply counts. Prompts are never chased and never expire --
+# a boss who taps Reject and says nothing is entitled to -- so without this
+# window an unrelated "ok thanks" replied into the group a week later would be
+# filed as the reason and reject the PO.
+REASON_FRESH_SECONDS = 3600
+
+
+def pick_rejection(pending, user_id, reply_to_id, now=None):
+    """Which outstanding rejection this message answers.
+
+    (key, entry, error). Replying to the prompt always wins, however old it
+    is. Failing that, exactly one RECENT rejection is unambiguous; anything
+    else would be a guess, and a reason filed against the wrong PO is worse
+    than being asked again.
+    """
+    mine = {k: v for k, v in (pending or {}).items() if v["user_id"] == user_id}
+    if not mine:
+        return None, None, ""
+    if reply_to_id is not None and reply_to_id in mine:
+        return reply_to_id, mine[reply_to_id], ""
+    now = time.time() if now is None else now
+    fresh = {k: v for k, v in mine.items()
+             if now - float(v.get("at", 0)) <= REASON_FRESH_SECONDS}
+    if len(fresh) == 1:
+        k = next(iter(fresh))
+        return k, fresh[k], ""
+    names = ", ".join(f"#{v['po_no']}" for v in mine.values())
+    if not fresh:
+        return None, None, (
+            f"There is still a rejection waiting for a reason ({names}), but it "
+            f"has been open a while. Reply directly to that message if you meant "
+            f"to answer it \u2014 otherwise ignore this.")
+    return None, None, (
+        f"You have {len(fresh)} rejections waiting for a reason ({names}). "
+        f"Reply directly to the message naming the PO you mean.")
+
+
 async def _maybe_capture_reason(update, context):
-    pend = context.chat_data.get("await_reason")
-    if not pend or update.effective_user.id != pend["user_id"]:
+    pending = context.chat_data.get("await_reason") or {}
+    reply_to = update.message.reply_to_message
+    key, pend, err = pick_rejection(
+        pending, update.effective_user.id,
+        reply_to.message_id if reply_to else None)
+    if err:
+        await update.message.reply_text(err)
+        return
+    if not pend:
         return
     reason = update.message.text.strip()
+    # A blank or one-character reply used to be stored verbatim, so the audit
+    # trail carried a rejection with no stated cause. The prompt stays open.
+    if len(reason) < MIN_REASON_CHARS:
+        await update.message.reply_text(
+            f"A reason of at least {MIN_REASON_CHARS} characters is required. "
+            f"PO #{pend['po_no']} has not been rejected \u2014 reply again with "
+            f"the reason.")
+        return
     po_no, stage = pend["po_no"], pend["stage"]
-    context.chat_data.pop("await_reason", None)
+    pending.pop(key, None)
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if not po or po.get("stage") != stage:
         await update.message.reply_text("This PO was already processed.")
@@ -687,7 +769,7 @@ async def _maybe_capture_reason(update, context):
         f"\u274c PO #{po_no} rejected at {flow.STAGE_LABEL[stage]}. The requester has been notified.")
     try:
         await context.bot.edit_message_reply_markup(
-            chat_id=update.effective_chat.id, message_id=pend["msg_id"], reply_markup=None)
+            chat_id=update.effective_chat.id, message_id=pend["card_id"], reply_markup=None)
     except Exception:
         pass
     try:
@@ -729,7 +811,7 @@ def build_app():
     # The upload router must come BEFORE the generic one, or every "up:" tap is
     # swallowed with no error and nothing in the logs.
     upload_handlers.register(app, {"ask_reason": _ask_reason})
-    post_handlers.register(app)
+    post_handlers.register(app, {"stock_checked": stock_checked})
     group_handlers.register(app)
     app.add_handler(CallbackQueryHandler(
         on_callback, pattern=r"^(?!up:|sc:|bk:price:|rc:|cx:)"))

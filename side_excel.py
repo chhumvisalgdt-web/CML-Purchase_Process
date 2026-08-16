@@ -33,7 +33,15 @@ NA = {"#n/a", "n/a", "na", "-"}
 
 
 def _norm(v):
-    return re.sub(r"\s+", " ", str(v or "")).strip()
+    """Text of a cell, with 0 preserved.
+
+    `str(v or "")` turned an Excel integer 0 into an empty string, because 0 is
+    falsy. The stock controller typing 0 -- none on the shelf, the strongest
+    argument there is FOR the order -- was told "on-hand is required".
+    """
+    if v is None:
+        return ""
+    return re.sub(r"\s+", " ", str(v)).strip()
 
 
 def _to_float(v):

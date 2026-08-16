@@ -5,7 +5,7 @@ A Telegram bot that runs the CML purchase-order approval flow and stores everyth
 ## Flow
 
 1. **Requester** (DM) — `/new`, then either upload a filled template or ask for a blank one (Reagent or Other). The bot validates the file, shows a preview, and only then asks for the reason and the urgent flag.
-2. **Stock controller** (group) — Approve / Reject.
+2. **Stock controller** (group) — the PO arrives as an Excel count file; filling in `On hand` and sending it back is the check, and passes it to Bookkeeping. Or Reject.
 3. **Bookkeeping** (group) — books in QBO, taps Booked / Reject.
 4. **Finance manager** (group) — approves and picks the payment route: **Cash Advance** or **A/P**, or rejects.
 5. Then it branches:
@@ -32,7 +32,7 @@ There is no ordering gate — nobody taps "Ordered". The trade-off is that `orde
 ## Post-approval stages
 
 ### Stock count (stage 1)
-The stock controller must enter units on hand before passing the PO on — `📊 Enter stock on hand` sends a small Excel file. `#N/A` is a permitted answer where a count is not possible, and it never coerces to 0: zero means "none in stock", which is the strongest possible argument *for* the order. Counts land in `Stock_Counts` (append-only) and appear as a **Stock** column on the order table of every approver's PDF, next to the quantity requested — the count exists so Finance, GM and the Board can judge whether the amount asked for is reasonable, so it has to be on their copy, not just the stock controller's.
+The PO reaches the stock group **as the count file itself**, not as a PDF — the file already lists code, item, pack and quantity requested, so a read-only copy of the same thing was one document too many. **Returning the completed file is the check**, signed by whoever filled it in; there is no separate "Checked" button to press afterwards. `/stock <po>` re-sends the file if it is lost. `#N/A` is a permitted answer where a count is not possible, and it never coerces to 0: zero means "none in stock", which is the strongest possible argument *for* the order. Counts land in `Stock_Counts` (append-only) and appear as a **Stock** column on the order table of every approver's PDF, next to the quantity requested — the count exists so Finance, GM and the Board can judge whether the amount asked for is reasonable, so it has to be on their copy, not just the stock controller's.
 
 ### Price confirmation (stage 2)
 Bookkeeping confirms the price with the supplier before Finance, GM and the Board approve, so the approvers see the real figure and nothing needs re-approving later. `💲 Confirm / update prices` sends a file with the master price and a blank confirmed-price column; a blank line keeps the master price. `ref_price` keeps the master figure permanently, so approved-versus-confirmed stays visible on PDF page 2 for the life of the PO.
@@ -149,6 +149,7 @@ Typing `/` shows a menu of that chat's commands. It is published automatically o
 - `/mypos` — your POs and their status
 - `/setup` — post and pin this group's own command card (run once in each group)
 - `/pending` — POs awaiting approval and for how long (finance group)
+- `/stock <po>` — re-send a stock count file (stock controller group)
 - `/receive <po>` — goods receipt (stock controller group)
 - `/outstanding` — monthly cancellation review (finance group)
 - `/mastercheck` — list codes duplicated across the master tabs
@@ -186,7 +187,7 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `post_handlers.py` — Telegram wiring for the post-approval stages
 - `group_handlers.py` — per-group command cards, pinning, and the finance chase list
 - `clock.py` — the single timezone-aware clock every timestamp comes from
-- `test_upload_validate.py`, `test_receipt_validate.py` — 56 tests
+- `test_upload_validate.py`, `test_receipt_validate.py` — 58 tests
 
 ## Before first use
 

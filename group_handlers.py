@@ -33,18 +33,20 @@ GROUP_CARDS = {
         "role": ("Check the request against what is on the shelf, then record "
                  "what arrives once the order has gone out."),
         "steps": [
-            "Tap <b>Enter stock on hand</b> and fill in the file the bot sends. "
-            "Enter <code>#N/A</code> where you cannot count. This is required "
-            "before the PO can move on.",
-            "Tap <b>Checked</b> to pass it to Bookkeeping, or <b>Reject</b> and "
-            "reply with the reason.",
+            "Each PO arrives as an Excel file. Fill in the <b>On hand</b> "
+            "column and send it back \u2014 that records the count and passes "
+            "the PO to Bookkeeping. Enter <code>#N/A</code> where you cannot "
+            "count, and <code>0</code> where there is none.",
+            "To stop a PO instead, tap <b>Reject</b> and reply with the reason. "
+            "Lost the file? Send <code>/stock &lt;PO number&gt;</code>.",
             "You are told when a PO is approved. When the goods arrive, send "
             "<code>/receive &lt;PO number&gt;</code>. "
             "The bot sends a file with only the lines still outstanding.",
             "Enter what you <b>counted</b>, not what the invoice says. One row "
             "per lot. Invoice number and date are required.",
         ],
-        "cmds": [("/receive &lt;po&gt;", "start a goods receipt"),
+        "cmds": [("/stock &lt;po&gt;", "re-send a stock count file"),
+                 ("/receive &lt;po&gt;", "start a goods receipt"),
                  ("/mypos", "POs you raised"),
                  ("/chatid", "this group's ID")],
     },
@@ -139,7 +141,8 @@ COMMON_GROUP_COMMANDS = [
     ("chatid", "Show this chat's ID"),
 ]
 GROUP_COMMANDS = {
-    "stock": [("receive", "Record a delivery: /receive <PO number>")],
+    "stock": [("stock", "Re-send a stock count file: /stock <PO number>"),
+              ("receive", "Record a delivery: /receive <PO number>")],
     "fin": [("pending", "POs awaiting approval, and for how long"),
             ("outstanding", "Monthly review: cancel undelivered lines")],
 }

@@ -240,7 +240,7 @@ def read_request(data):
     for r in range(DATA_LAST + 2, min(ws.max_row, DATA_LAST + 60) + 1):
         code = ws.cell(row=r, column=COL_CODE).value
         qty = ws.cell(row=r, column=COL_QTY).value
-        if norm_code(code) and str(qty or "").strip():
+        if norm_code(code) and qty is not None and str(qty).strip():
             below += 1
 
     cat_raw = str(ws[META_CELLS["category"]].value or "").strip().casefold()

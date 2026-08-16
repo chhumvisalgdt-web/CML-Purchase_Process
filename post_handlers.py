@@ -20,6 +20,8 @@ import logging
 from datetime import date, datetime
 from io import BytesIO
 
+from openpyxl import load_workbook
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -32,6 +34,13 @@ from config import Config
 from sheets import sheets
 
 log = logging.getLogger("po_bot.post")
+
+_HOOKS = {}
+
+# Which group may act on which kind of file. Without this a price file
+# returned in the stock group would still be applied.
+KIND_GROUP = {"stock": "stock", "receipt": "stock", "price": "book",
+              "cancel": "fin"}
 
 MAX_BYTES = Config.MAX_UPLOAD_BYTES
 XL = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -68,6 +77,33 @@ def _wrong_file(meta, kind, po_no=None):
                 f"waiting here is for PO #{po_no}. Nothing has been recorded "
                 f"— ask for a fresh file for the PO you mean.")
     return ""
+
+
+def _peek(data):
+    """(kind, po_no) from the hidden _meta tab of a generated file.
+
+    Routing on the file itself rather than on what was last requested. The
+    group has ONE pending slot, so two POs arriving in a row used to leave the
+    first one's file unroutable -- and with no button left to ask for it
+    again, unrecoverable. The file already knows which PO it belongs to.
+    """
+    try:
+        wb = load_workbook(BytesIO(data), data_only=True, read_only=True)
+    except Exception:
+        return "", ""
+    try:
+        if "_meta" not in wb.sheetnames:
+            return "", ""
+        mw = wb["_meta"]
+        got = {}
+        for i in range(1, (mw.max_row or 0) + 1):
+            k = mw.cell(row=i, column=1).value
+            v = mw.cell(row=i, column=2).value
+            if k is not None:
+                got[str(k).strip()] = "" if v is None else str(v).strip()
+        return got.get("kind", ""), got.get("po_no", "")
+    finally:
+        wb.close()
 
 
 async def _download(doc, context):
@@ -127,6 +163,35 @@ async def cmd_receive(update, context):
                  "you are done."))
 
 
+async def cmd_stock(update, context):
+    """Re-issue the count file. There is no button for it any more, so without
+    this a lost file would strand the PO at the stock stage."""
+    if not _is(update.effective_chat.id, "stock"):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Send /stock followed by the PO number, e.g. /stock 190.")
+        return
+    po_no = str(args[0]).strip().lstrip("#")
+    po = await asyncio.to_thread(sheets.get_po, po_no)
+    if not po:
+        await update.message.reply_text(f"PO #{po_no} not found.")
+        return
+    if str(po.get("stage", "")).strip() != flow.STAGE_STOCK:
+        await update.message.reply_text(
+            f"PO #{po_no} is at '{flow.STAGE_LABEL.get(po.get('stage'), po.get('stage'))}' "
+            f"\u2014 the stock count belongs to the Stock controller stage.")
+        return
+    lines = await asyncio.to_thread(sheets.get_line_items, po_no)
+    built = await asyncio.to_thread(sx.build_stock_file, po_no, lines)
+    await update.message.reply_document(
+        document=BytesIO(built["bytes"]), filename=built["filename"],
+        caption=(f"PO #{po_no} \u00b7 {po.get('supplier', '')}\n"
+                 "Fill in On hand and send it back. That records the count and "
+                 "passes the PO to Bookkeeping."))
+
+
 async def _handle_receipt(update, context, data, po_no):
     rows, meta = await asyncio.to_thread(rx.read_receipt, data)
     if meta.get("error"):
@@ -169,7 +234,7 @@ async def _handle_receipt(update, context, data, po_no):
 def _fmt_date(v):
     if isinstance(v, (datetime, date)):
         return v.strftime("%d-%b-%Y")
-    return str(v or "").strip()
+    return "" if v is None else str(v).strip()
 
 
 def _receipt_card(po_no, res, blocked=False):
@@ -297,10 +362,20 @@ async def _handle_stock(update, context, data, po_no):
         {c["line_id"]: {"on_hand": c["on_hand"]} for c in counts})
     context.chat_data.pop("pending", None)
     na = sum(1 for c in counts if str(c["on_hand"]).upper() in ("#N/A", "N/A"))
-    await update.message.reply_text(
-        f"Stock count recorded for PO #{po_no} ({len(counts)} line(s)"
-        + (f", {na} without a count" if na else "") +
-        "). Approvers will see it on the card and the PDF. You can tap Checked now.")
+    head = (f"Stock count recorded for PO #{po_no} ({len(counts)} line(s)"
+            + (f", {na} without a count" if na else "") + ").")
+
+    # Returning the file IS the check -- signed by whoever filled it in.
+    outcome = await _HOOKS["stock_checked"](context, po_no, update.effective_user)
+    if outcome == "advanced":
+        await update.message.reply_text(
+            head + " Checked by you, and passed to Bookkeeping.")
+    elif outcome == "moved":
+        await update.message.reply_text(
+            head + " The PO had already moved on, so it was not passed along "
+            "again \u2014 the count is still recorded.")
+    else:
+        await update.message.reply_text(head)
 
 
 # ===================== price confirmation (stage 2) =====================
@@ -452,22 +527,33 @@ async def on_document(update, context):
     if not doc:
         return
     pending = context.chat_data.get("pending") or {}
-    kind = pending.get("kind")
-    if kind not in ("receipt", "stock", "price", "cancel"):
+    if not doc.file_name or not doc.file_name.lower().endswith((".xlsx", ".xlsm")):
         return
     data, err = await _download(doc, context)
     if err:
         await update.message.reply_text(err)
         return
+
+    kind, po_no = await asyncio.to_thread(_peek, data)
+    if kind not in KIND_GROUP:
+        # No usable _meta: fall back to whatever this group last asked for.
+        kind, po_no = pending.get("kind", ""), pending.get("po_no", "")
+    if kind not in KIND_GROUP:
+        return
+    if not _is(update.effective_chat.id, KIND_GROUP[kind]):
+        await update.message.reply_text(
+            f"That is the {kind} file. It is handled in a different group.")
+        return
+
     sha = hashlib.sha256(data).hexdigest()
-    log.info("post-approval upload kind=%s sha=%s", kind, sha[:12])
+    log.info("post-approval upload kind=%s po=%s sha=%s", kind, po_no, sha[:12])
     try:
         if kind == "receipt":
-            await _handle_receipt(update, context, data, pending["po_no"])
+            await _handle_receipt(update, context, data, po_no)
         elif kind == "stock":
-            await _handle_stock(update, context, data, pending["po_no"])
+            await _handle_stock(update, context, data, po_no)
         elif kind == "price":
-            await _handle_price(update, context, data, pending["po_no"])
+            await _handle_price(update, context, data, po_no)
         elif kind == "cancel":
             await _handle_cancel(update, context, data)
     except Exception:
@@ -501,11 +587,13 @@ async def on_callback(update, context):
         await q.message.reply_text("Something went wrong. Try again.")
 
 
-def register(app):
+def register(app, hooks=None):
     """Registered BEFORE the generic callback handler: within a group the first
     handler added wins, so a broad handler registered first would swallow these
     with no error and nothing in the logs."""
+    _HOOKS.update(hooks or {})
     app.add_handler(CommandHandler("receive", cmd_receive))
+    app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("outstanding", cmd_outstanding))
     app.add_handler(CallbackQueryHandler(
         on_callback, pattern=r"^(sc:|bk:price:|rc:|cx:)"))

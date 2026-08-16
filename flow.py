@@ -151,12 +151,11 @@ def action_keyboard(stage, po_no):
                                   callback_data=f"a:book:no:{po_no}")],
         ])
     if stage == STAGE_STOCK:
+        # No "Checked" button: returning the completed count file IS the check,
+        # signed by whoever filled it in. A separate tap only ever recorded
+        # that someone pressed a button afterwards.
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f4ca Enter stock on hand",
-                                  callback_data=f"sc:ask:{po_no}")],
-            [InlineKeyboardButton("\u2705 Checked",
-                                  callback_data=f"a:stock:ok:{po_no}"),
-             InlineKeyboardButton("\u274c Reject",
+            [InlineKeyboardButton("\u274c Reject",
                                   callback_data=f"a:stock:no:{po_no}")],
         ])
     if stage == STAGE_FIN:
@@ -212,7 +211,12 @@ def _item_line(it, show_prices=True):
             s += f" (was {money(ref)})"
     vr = str(it.get("variant_reason", "")).strip()
     if vr:
-        s += f"\n   \U0001f4dd supplier choice: {html.escape(vr)}"
+        # This is the requester's Note column from the template, not a
+        # justification of the supplier. It was labelled "supplier choice" back
+        # when the bot asked that question separately; it no longer does, and
+        # "Reagent out of stock" is plainly a reason to order, not a reason to
+        # pick a vendor.
+        s += f"\n   \U0001f4dd note: {html.escape(vr)}"
     return s
 
 

@@ -70,7 +70,12 @@ def norm_code(value):
 
 
 def norm_text(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    """Text of a cell, with 0 preserved -- see side_excel._norm. A row whose
+    only entry is a quantity of 0 must still count as touched, or it is
+    skipped in silence instead of asking for the note that explains it."""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 def is_na(value):

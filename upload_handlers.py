@@ -295,30 +295,11 @@ async def _confirm(q, context):
     except Exception:
         pass
 
-    if s["cheaper_elsewhere"]:
-        context.user_data["state"] = "supplier_why"
-        names = "\n".join(f"  \u2022 {html.escape(n)}"
-                          for n in s["cheaper_elsewhere"][:6])
-        await q.message.reply_text(
-            f"{_plural(len(s['cheaper_elsewhere']), 'item')} on this order "
-            f"can be bought cheaper from another supplier:\n{names}\n\n"
-            f"Why {html.escape(s['supplier'])} for this order? Reply with a short "
-            f"note \u2014 the approvers will see it.")
-        return
-
+    # The requester is not asked to justify the supplier. She already writes a
+    # note per line in the Note column of the template, and that note travels
+    # to the approvers on the card and PDF page 2. Asking again in Telegram
+    # collected the same sentence twice.
     await _HOOKS["ask_reason"](q, context)
-
-
-async def handle_supplier_why(update, context):
-    """state == 'supplier_why'. Called from bot.on_text."""
-    reason = update.message.text.strip()
-    if not reason:
-        await update.message.reply_text("Please type a short reason.")
-        return
-    draft = context.user_data.get("draft") or {}
-    draft["supplier_reason"] = reason
-    context.user_data["state"] = None
-    await _HOOKS["ask_reason"](update, context)
 
 
 def register(app, hooks):

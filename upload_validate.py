@@ -57,7 +57,9 @@ def norm_code(value):
 
 
 def norm_name(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip().casefold()
 
 
 def to_float(value):
@@ -392,7 +394,10 @@ def validate(rows, index, max_lines=MAX_LINES, template_supplier=None,
         code = norm_code(raw.get("code"))
         qty_raw = raw.get("qty")
         note = re.sub(r"\s+", " ", str(raw.get("note") or "")).strip()
-        has_qty = to_qty(qty_raw) is not None or str(qty_raw or "").strip() != ""
+        # A typed 0 makes the row populated, so it is reported as a bad
+        # quantity rather than skipped as if nobody had touched it.
+        has_qty = (to_qty(qty_raw) is not None
+                   or (qty_raw is not None and str(qty_raw).strip() != ""))
 
         if not code and not has_qty and not note:
             continue
