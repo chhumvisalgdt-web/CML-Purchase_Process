@@ -16,14 +16,21 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from clock import local_now
 
 from upload_validate import (CAT_OTHER, CAT_REAGENT, CATEGORY_LABEL, MAX_LINES,
-                             STATUS_OK, cheaper_alternative, norm_code)
+                             STATUS_OK, cheaper_alternative, norm_code,
+                             orderable_rows)
 
-TEMPLATE_VERSION = "1.0"
+# 2.0: the input column holds the ITEM NAME, not the Material Code. The code
+# moved one column right and fills itself in. Column POSITIONS of the three
+# input cells are unchanged (B, F, G), so the reader is identical for both
+# versions and a 1.0 file already in someone's Downloads folder still parses --
+# its B cell simply carries a code, which resolve_key() still honours.
+TEMPLATE_VERSION = "2.0"
 SHEET_NAME = "PO Request"
 MASTER_SHEET = "Master"
 DATA_FIRST = 8
 DATA_LAST = DATA_FIRST + MAX_LINES - 1
-COL_CODE, COL_QTY, COL_NOTE = 2, 6, 7
+COL_ITEM, COL_QTY, COL_NOTE = 2, 6, 7
+COL_CODE = COL_ITEM  # the reader's name for column B, whatever it now holds
 META_CELLS = {"version": "B5", "generated": "D5", "category": "F5",
               "supplier": "G5"}
 
@@ -43,26 +50,29 @@ BOX = Border(left=HAIR, right=HAIR, top=HAIR, bottom=HAIR)
 # note from B, F and G, so a template issued before these columns existed still
 # parses correctly. Inserting would have silently shifted Qty on every file
 # already in circulation.
-HEADERS = ["No.", "Material Code", "Item (auto)", "Supplier (auto)",
+HEADERS = ["No.", "Item", "Material Code (auto)", "Supplier (auto)",
            "Pack (auto)", "Qty", "Note", "Also sold by (auto)", "Diff (auto)"]
-WIDTHS = [6, 20, 44, 26, 16, 9, 30, 26, 12]
+WIDTHS = [6, 52, 20, 26, 16, 9, 30, 26, 12]
 LAST_COL = "I"
 
 
-def _lookup(code_cell, master_col, n_master):
+def _lookup(key_cell, master_col, n_master):
     out = f"{MASTER_SHEET}!${master_col}$2:${master_col}${n_master + 1}"
     key = f"{MASTER_SHEET}!$A$2:$A${n_master + 1}"
-    return (f'=IF({code_cell}="","",'
-            f'IFERROR(INDEX({out},MATCH({code_cell},{key},0)),"CODE NOT FOUND"))')
+    return (f'=IF({key_cell}="","",'
+            f'IFERROR(INDEX({out},MATCH({key_cell},{key},0)),"NOT ON THIS LIST"))')
 
 
 def build_template(index, category, supplier, out_path=None):
-    """Rows come from MasterIndex.rows_for(), which already excludes codes that
-    are duplicated anywhere in the master -- unusable, so never offered."""
+    """Rows come from orderable_rows(), which applies the one rule this form
+    depends on: an item that cannot be identified unambiguously is not offered.
+
+    That drops three groups -- codes duplicated across the master, names
+    repeated inside THIS supplier's list, and rows with no price -- and each is
+    counted back so the caption can say what is missing rather than leaving a
+    silent hole in the drop-down."""
     candidates = index.rows_for(category, supplier)
-    master = sorted((r for r in candidates
-                     if r["unit_price"] and r["unit_price"] > 0),
-                    key=lambda r: r["material_code"])
+    master = orderable_rows(index, category, supplier)
     if not master:
         raise ValueError(f"no usable items for {category} / {supplier}")
     n = len(master)
@@ -70,7 +80,9 @@ def build_template(index, category, supplier, out_path=None):
     # was every duplicate in the master, so a supplier with no duplicates at
     # all was still told that items were unavailable.
     excluded = index.excluded_for(category, supplier)
-    no_price = len(candidates) - n
+    excluded_names = index.excluded_names_for(category, supplier)
+    no_price = sum(1 for r in candidates
+                   if not (r["unit_price"] and r["unit_price"] > 0))
 
     wb = Workbook()
     ws = wb.active
@@ -84,8 +96,9 @@ def build_template(index, category, supplier, out_path=None):
     ws.row_dimensions[1].height = 24
 
     for i, text in enumerate((
-            "Fill in only the shaded cells: Material Code, Qty and Note. "
-            "Item, Supplier and Pack fill in by themselves.",
+            "Fill in only the shaded cells: Item, Qty and Note. Pick the item "
+            "from the drop-down list -- Material Code, Supplier and Pack fill "
+            "in by themselves.",
             f"Maximum {MAX_LINES} line items per order. Need more? Send a second "
             "file - each file becomes its own PO.",
             "Do not add or delete rows, rename the tabs, or edit the Master tab. "
@@ -127,7 +140,7 @@ def build_template(index, category, supplier, out_path=None):
         no.font = Font(name=FONT, size=10, color=MUTED)
         no.alignment = Alignment(horizontal="center")
         no.border = BOX
-        for col in (COL_CODE, COL_QTY, COL_NOTE):
+        for col in (COL_ITEM, COL_QTY, COL_NOTE):
             c = ws.cell(row=r, column=col)
             c.font = Font(name=FONT, size=10, color=INPUT_BLUE)
             c.fill = INPUT_FILL
@@ -153,9 +166,10 @@ def build_template(index, category, supplier, out_path=None):
 
     dv = DataValidation(type="list", formula1=f"={MASTER_SHEET}!$A$2:$A${n + 1}",
                         allow_blank=True, showErrorMessage=True,
-                        errorTitle="Unknown material code",
-                        error="Pick a code from the list. If the item you need is "
-                              "missing, ask the bot for a fresh template.")
+                        errorTitle="Unknown item",
+                        error="Pick an item from the drop-down list. If the item "
+                              "you need is missing, ask the bot for a fresh "
+                              "template.")
     ws.add_data_validation(dv)
     dv.add(f"B{DATA_FIRST}:B{DATA_LAST}")
     dvq = DataValidation(type="whole", operator="between", formula1=1,
@@ -170,15 +184,16 @@ def build_template(index, category, supplier, out_path=None):
     ws.freeze_panes = f"A{DATA_FIRST}"
 
     ms = wb.create_sheet(MASTER_SHEET)
-    for i, head in enumerate(["Material Code", "Item", "Supplier", "Pack",
+    # Column A is the lookup key, and the key is now the name.
+    for i, head in enumerate(["Item", "Material Code", "Supplier", "Pack",
                               "Also sold by", "Diff"], 1):
         c = ms.cell(row=1, column=i, value=head)
         c.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
         c.fill = HEAD_FILL
-    for i, w in enumerate([20, 44, 26, 16, 26, 12], 1):
+    for i, w in enumerate([52, 20, 26, 16, 26, 12], 1):
         ms.column_dimensions[get_column_letter(i)].width = w
     for r, row in enumerate(master, start=2):
-        for col, key in enumerate(("raw_code", "item", "supplier", "pack"), 1):
+        for col, key in enumerate(("item", "raw_code", "supplier", "pack"), 1):
             c = ms.cell(row=r, column=col, value=row[key])
             c.font = Font(name=FONT, size=10, color=INK)
         # Who else sells this, and by how much they differ PER TEST. Relative
@@ -198,7 +213,8 @@ def build_template(index, category, supplier, out_path=None):
     buf = BytesIO()
     wb.save(out_path or buf)
     return {"path": out_path, "bytes": None if out_path else buf.getvalue(),
-            "n_items": n, "n_excluded": excluded, "n_no_price": no_price,
+            "n_items": n, "n_excluded": excluded,
+            "n_excluded_names": excluded_names, "n_no_price": no_price,
             "filename": _template_name(category, supplier)}
 
 
@@ -265,8 +281,13 @@ def read_request(data):
     return rows, meta
 
 
-REPORT_HEADERS = ["Row", "Material Code", "Qty", "Note", "Status", "What to do"]
-REPORT_WIDTHS = [7, 22, 9, 30, 18, 72]
+# "Item entered" is the cell verbatim -- whatever she picked or typed. The
+# resolved code sits beside it so a blocked row and a good one can be told
+# apart at a glance: a good row has a code, a blocked one has an empty cell
+# and a sentence saying why.
+REPORT_HEADERS = ["Row", "Item entered", "Material Code", "Qty", "Note",
+                  "Status", "What to do"]
+REPORT_WIDTHS = [7, 52, 20, 9, 30, 18, 72]
 
 
 def write_report(result, meta, out_path=None):
@@ -275,7 +296,7 @@ def write_report(result, meta, out_path=None):
     ws.title = "Validation report"
     s = result.summary
 
-    ws.merge_cells("A1:F1")
+    ws.merge_cells("A1:G1")
     t = ws["A1"]
     t.value = "CML purchase order - upload validation report"
     t.font = Font(name=FONT, size=14, bold=True, color="187B85")
@@ -293,7 +314,7 @@ def write_report(result, meta, out_path=None):
                      f"{DATA_FIRST}-{DATA_LAST}.")
     for i, text in enumerate(lines):
         r = 2 + i
-        ws.merge_cells(f"A{r}:F{r}")
+        ws.merge_cells(f"A{r}:G{r}")
         c = ws[f"A{r}"]
         c.value = text
         c.font = Font(name=FONT, size=10,
@@ -311,7 +332,8 @@ def write_report(result, meta, out_path=None):
     for i, row in enumerate(result.report, start=1):
         r = head + i
         ok = row["status"] == STATUS_OK
-        values = [row["row_no"], row["raw_code"], row["raw_qty"], row["raw_note"],
+        values = [row["row_no"], row["raw_code"], row["matched_code"],
+                  row["raw_qty"], row["raw_note"],
                   "OK" if ok else row["status"].replace("_", " "),
                   row["message"] or row["matched_item"]]
         for col, val in enumerate(values, start=1):
@@ -319,7 +341,7 @@ def write_report(result, meta, out_path=None):
             c.font = Font(name=FONT, size=10, color=INK)
             c.fill = OK_FILL if ok else BAD_FILL
             c.border = BOX
-            c.alignment = Alignment(vertical="center", wrap_text=(col == 6))
+            c.alignment = Alignment(vertical="center", wrap_text=(col == 7))
 
     buf = BytesIO()
     wb.save(out_path or buf)

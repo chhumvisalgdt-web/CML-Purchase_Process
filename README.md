@@ -119,11 +119,11 @@ Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier c
 
 The requester never types an item name, a supplier or a price.
 
-- **Blank template** — generated live from the master list and filtered to one **category** and one **supplier**, so codes from anywhere else are physically absent from the file. `Material Code` is a validated dropdown; `Qty` accepts whole numbers only. Item, Supplier and Pack fill themselves by lookup.
-- **Filled template** — send it to the bot in a DM at any time. Only rows 8–19 of the `PO Request` tab are read, and only columns B (code), F (qty) and G (note). The lookup columns are never read: item, supplier, pack and price are re-resolved from the live master by code, so a broken formula or a stale Master tab cannot affect what gets ordered.
+- **Blank template** — generated live from the master list and filtered to one **category** and one **supplier**, so items from anywhere else are physically absent from the file. `Item` is a validated dropdown of **item names**; `Qty` accepts whole numbers only. Material Code, Supplier and Pack fill themselves by lookup. The requester never sees or types a code — she picks the thing she wants by its name.
+- **Filled template** — send it to the bot in a DM at any time. Only rows 8–19 of the `PO Request` tab are read, and only columns B (item), F (qty) and G (note). The lookup columns are never read: code, supplier, pack and price are re-resolved from the live master, so a broken formula or a stale Master tab cannot affect what gets ordered. A **code** typed into column B still resolves — v1.0 templates put one there and are still in circulation.
 - **All-or-nothing** — if any row is blocked, nothing is submitted. The bot returns her own file with `Status` and `What to do` columns appended; she fixes it and re-uploads.
 - **Maximum 12 lines per PO** (`MAX_LINES`). A larger order becomes several files, one PO each.
-- **One supplier and one category per PO.** Both are *derived from the codes*, never read from the file. The template's own metadata is recorded as provenance and flagged if it disagrees, but it can never change an outcome.
+- **One supplier and one category per PO.** Still derived from the resolved rows, and still enforced. But note what changed with v2.0: a **name only identifies an item inside one supplier's list**, so the template's declared supplier and category (`G5`, `F5`) are now *inputs to resolution*, not merely provenance. They are locked cells on a protected sheet, and a file that declares a list which does not exist is blocked (`unknown_list`) rather than falling back to a search of the whole master.
 
 ### Blocking statuses
 
@@ -133,11 +133,13 @@ The last two should be unreachable through normal use, since foreign codes aren'
 
 ### Price-blindness
 
-`Material Code` is the only key — item names never resolve anything. The requester sees no prices at any point, including in the preview. When a cheaper supplier exists for something on the order, the bot asks *why this supplier* and names the items **without showing any figure**. That justification is PO-level (the supplier is chosen once, before any item is seen) and appears on PDF page 2 for the price-visible approvers.
+The **item name**, scoped to one supplier's list, is the requester's key; `Material Code` remains the master's own key and still resolves. The requester sees no prices at any point, including in the preview. When a cheaper supplier exists for something on the order, the bot asks *why this supplier* and names the items **without showing any figure**. That justification is PO-level (the supplier is chosen once, before any item is seen) and appears on PDF page 2 for the price-visible approvers.
 
 ### Duplicate codes
 
 A code that appears more than once across the two master tabs cannot identify one item. Such codes are **excluded from the index entirely** — never templated, and blocked on upload. There is no first-match fallback, because a wrong material code on a price-blind PO stays invisible until reconciliation. Run `/mastercheck` to list them.
+
+The same rule now applies to **names**: a name carried by two rows of *one supplier's* list — almost always the same product in two pack sizes — cannot identify one item either. Those rows are dropped from the drop-down, the template caption says how many went missing, and typing the name blocks with `ambiguous_name`. The fix is editorial, not technical: put the pack into the `CML Reagent` name (`HBs Ag (25 Tests)` / `HBs Ag (50/Kit)`), which is what most rows already do. `/mastercheck` lists them. Names repeated **across** suppliers are untouched — that is how an equivalent is declared.
 
 ## Google Sheet
 

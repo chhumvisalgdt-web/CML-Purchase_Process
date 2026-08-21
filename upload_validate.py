@@ -4,9 +4,14 @@ Pure functions: no Telegram, no gspread, no I/O. The caller reads the workbook
 into raw rows, calls build_index() over the two master tabs, then validate().
 
 Design rules this file enforces:
-  * Material Code is the only key. Item names never resolve anything.
+  * The requester identifies an item by NAME, inside one supplier's list. The
+    Material Code is still the master's own key and still resolves -- templates
+    issued before v2.0 carry codes in that same cell -- but nothing asks her
+    for one.
   * A code that appears more than once across the master tabs is UNUSABLE, not
     guessable -- it blocks rather than resolving to whichever row came first.
+    A name repeated inside ONE supplier's list is unusable for the same reason
+    and by the same rule: it never resolves to whichever pack came first.
   * The requester is price-blind. Nothing returned for display to her carries a
     price; cheaper-elsewhere is reported as item names and a count only.
   * Supplier and category are DERIVED from the codes, never taken from the file.
@@ -26,15 +31,24 @@ STATUS_DUPLICATE_CODE = "duplicate_code"
 STATUS_NO_PRICE = "no_price"
 STATUS_BAD_QTY = "bad_qty"
 STATUS_MISSING_CODE = "missing_code"
+# Same wire value on purpose: the cell changed from a code to a name, the
+# fault did not, and Upload_Rows history stays comparable across the change.
+STATUS_MISSING_ITEM = STATUS_MISSING_CODE
 STATUS_DUPLICATE_LINE = "duplicate_line"
 STATUS_OVER_LIMIT = "over_limit"
 STATUS_SUPPLIER_CONFLICT = "supplier_conflict"
 STATUS_MIXED_CATEGORY = "mixed_category"
+# The form now asks for the item by NAME, so a name can fail in ways a code
+# never could: it can be spelt for a list that does not exist, or it can be
+# carried by two rows of one supplier's list at once.
+STATUS_AMBIGUOUS_NAME = "ambiguous_name"
+STATUS_UNKNOWN_LIST = "unknown_list"
 
 BLOCKING = {
     STATUS_NOT_FOUND, STATUS_DUPLICATE_CODE, STATUS_NO_PRICE, STATUS_BAD_QTY,
     STATUS_MISSING_CODE, STATUS_DUPLICATE_LINE, STATUS_OVER_LIMIT,
-    STATUS_SUPPLIER_CONFLICT, STATUS_MIXED_CATEGORY,
+    STATUS_SUPPLIER_CONFLICT, STATUS_MIXED_CATEGORY, STATUS_AMBIGUOUS_NAME,
+    STATUS_UNKNOWN_LIST,
 }
 
 CATEGORY_LABEL = {CAT_REAGENT: "Laboratory consumption", CAT_OTHER: "Other"}
@@ -415,6 +429,86 @@ def alternatives_for(items, index):
     return out
 
 
+def orderable_rows(index, category, supplier):
+    """The rows a name-driven template for this list may offer.
+
+    Three exclusions, all of them the same rule -- an item that cannot be
+    identified unambiguously is not offered:
+      * code duplicated anywhere in the master (already absent from by_code),
+      * name repeated inside this supplier's list,
+      * no usable price.
+    Sorted by name, because a name is what the requester now scans for.
+    """
+    out = [r for r in index.rows_for(category, supplier)
+           if r["unit_price"] and r["unit_price"] > 0
+           and index.item(category, supplier, r["item"]) is not None]
+    return sorted(out, key=lambda r: (norm_name(r["item"]), r["material_code"]))
+
+
+def resolve_key(value, index, category=None, supplier=None):
+    """Resolve one cell of the item column to a master row.
+
+    Returns (row, status, message); status is STATUS_OK when row is not None.
+
+    The name is tried inside the template's own list, never across the whole
+    master: names are deliberately shared BETWEEN suppliers -- that is how an
+    equivalent is declared -- so a name is only ever an identifier within one
+    supplier's list.
+
+    A code is tried first. Templates issued before v2.0 put a code in this
+    cell and are still in circulation, and the code is unambiguous where it
+    resolves at all, so honouring it costs nothing and rescues those files.
+    """
+    raw = "" if value is None else re.sub(r"\s+", " ", str(value)).strip()
+    if not raw:
+        return None, STATUS_MISSING_ITEM, (
+            "Item is missing. Clear the whole row, or pick an item from the "
+            "drop-down list.")
+
+    code = norm_code(value)
+    if code and code in index.dup_codes:
+        return None, STATUS_DUPLICATE_CODE, (
+            f"Code {code} appears more than once in the master list, so it "
+            f"cannot be ordered until that is corrected.")
+    row = index.by_code.get(code)
+    if row is not None:
+        return row, STATUS_OK, ""
+
+    if category and supplier:
+        if not index.has_scope(category, supplier):
+            return None, STATUS_UNKNOWN_LIST, (
+                f"This file says it is the {CATEGORY_LABEL.get(category, category)} "
+                f"list for {supplier}, and no such list exists. Ask me for a "
+                f"fresh template.")
+        if index.name_is_ambiguous(category, supplier, raw):
+            return None, STATUS_AMBIGUOUS_NAME, (
+                f"\u201c{raw}\u201d now names more than one item on "
+                f"{supplier}'s list \u2014 usually the same product in two pack "
+                f"sizes. It cannot say which is meant. Ask me for a fresh "
+                f"template.")
+        row = index.item(category, supplier, raw)
+        if row is not None:
+            return row, STATUS_OK, ""
+        return None, STATUS_NOT_FOUND, (
+            f"\u201c{raw}\u201d is not on this template. Pick the item from the "
+            f"drop-down list rather than typing it, or you may be using the "
+            f"wrong template.")
+
+    # No template scope to work in: only a name that is unique across the whole
+    # master can be trusted, and most are not -- shared names are the point.
+    nkey = norm_name(raw)
+    hits = [r for (_c, _s, n), r in index.by_name.items() if n == nkey]
+    if len(hits) == 1 and not any(n == nkey for _c, _s, n in index.dup_names):
+        return hits[0], STATUS_OK, ""
+    if hits or any(n == nkey for _c, _s, n in index.dup_names):
+        return None, STATUS_AMBIGUOUS_NAME, (
+            f"\u201c{raw}\u201d is sold by more than one supplier, and this file "
+            f"does not say which list it is. Ask me for a fresh template.")
+    return None, STATUS_NOT_FOUND, (
+        f"\u201c{raw}\u201d is not in the master list. Ask me for a fresh "
+        f"template.")
+
+
 @dataclass
 class Result:
     items: list = field(default_factory=list)
@@ -455,7 +549,7 @@ def validate(rows, index, max_lines=MAX_LINES, template_supplier=None,
 
     for raw in rows:
         row_no = raw.get("row_no")
-        code = norm_code(raw.get("code"))
+        key_raw = "" if raw.get("code") is None else str(raw.get("code")).strip()
         qty_raw = raw.get("qty")
         note = re.sub(r"\s+", " ", str(raw.get("note") or "")).strip()
         # A typed 0 makes the row populated, so it is reported as a bad
@@ -463,7 +557,7 @@ def validate(rows, index, max_lines=MAX_LINES, template_supplier=None,
         has_qty = (to_qty(qty_raw) is not None
                    or (qty_raw is not None and str(qty_raw).strip() != ""))
 
-        if not code and not has_qty and not note:
+        if not key_raw and not has_qty and not note:
             continue
         populated += 1
 
@@ -474,32 +568,21 @@ def validate(rows, index, max_lines=MAX_LINES, template_supplier=None,
                 f"second file."))
             continue
 
-        if not code:
-            report.append(_report_row(
-                row_no, raw, STATUS_MISSING_CODE,
-                "Material code is missing. Clear the whole row, or enter a code."))
-            continue
-
-        if code in index.dup_codes:
-            report.append(_report_row(
-                row_no, raw, STATUS_DUPLICATE_CODE,
-                f"Code {code} appears more than once in the master list, so it "
-                f"cannot be ordered until that is corrected."))
-            continue
-
-        master = index.by_code.get(code)
+        master, status, message = resolve_key(
+            raw.get("code"), index, template_category, template_supplier)
         if master is None:
-            report.append(_report_row(
-                row_no, raw, STATUS_NOT_FOUND,
-                f"Code {code} is not in this template. Check the code, or you may "
-                f"be using the wrong template."))
+            report.append(_report_row(row_no, raw, status, message))
             continue
 
+        # From here the row IS identified, so everything downstream keys on the
+        # master's own code exactly as before -- the name was only ever the way
+        # in.
+        code = master["material_code"]
         if code in seen_codes:
             report.append(_report_row(
                 row_no, raw, STATUS_DUPLICATE_LINE,
-                f"Code {code} is already on row {seen_codes[code]}. Combine the "
-                f"quantities into one line.", master))
+                f"{master['item']} is already on row {seen_codes[code]}. Combine "
+                f"the quantities into one line.", master))
             continue
 
         price = master["unit_price"]

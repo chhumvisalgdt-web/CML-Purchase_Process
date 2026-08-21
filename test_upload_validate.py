@@ -518,3 +518,96 @@ def test_every_notice_names_the_po_and_the_rejecting_stage():
     for n in _f.rejection_notices(REJECTED_PO, "187", "board", "Mr. Chan", ""):
         assert "#187" in n["text"]
         assert "Board of director" in n["text"]
+
+
+# ---- v2.0: the form asks for the item by NAME ----
+
+NAMED = [
+    {"material_code": "CMLRE00001", "item": "ALBUMIN (Std Inc) (1x250mL)",
+     "supplier": "BOM CO.,LTD", "pack": "1x250mL", "unit_price": 20.33},
+    {"material_code": "CMLRE00002", "item": "alpha-AMYLASE - DIRECT 5x5mL",
+     "supplier": "BOM CO.,LTD", "pack": "5x5mL", "unit_price": 38.50},
+    {"material_code": "CMLRE00003", "item": "HBs Ag", "supplier": "BOM CO.,LTD",
+     "pack": "40/Kit", "unit_price": 18.5},
+    {"material_code": "CMLRE00004", "item": "HBs Ag", "supplier": "BOM CO.,LTD",
+     "pack": "50/Kit", "unit_price": 18.5},
+    {"material_code": "CMLRE00005", "item": "TBC REAGENT",
+     "supplier": "BOM CO.,LTD", "pack": "1L", "unit_price": ""},
+    {"material_code": "BT-0009", "item": "ALBUMIN (Std Inc) (1x250mL)",
+     "supplier": "BIO-TECHEM(CAM)", "pack": "1x250mL", "unit_price": 16.90},
+]
+NIDX = uv.build_index(NAMED, [])
+SCOPE = {"template_category": uv.CAT_REAGENT, "template_supplier": "BOM CO.,LTD"}
+
+
+def test_a_name_resolves_inside_the_templates_own_list():
+    res = uv.validate(rows(("ALBUMIN (Std Inc) (1x250mL)", 3, "")), NIDX, **SCOPE)
+    assert not res.blocked
+    assert res.items[0]["material_code"] == "CMLRE00001"
+    assert res.items[0]["line_total"] == 60.99
+
+
+def test_the_same_name_resolves_to_the_other_supplier_under_their_template():
+    res = uv.validate(rows(("ALBUMIN (Std Inc) (1x250mL)", 1, "")), NIDX,
+                      template_category=uv.CAT_REAGENT,
+                      template_supplier="BIO-TECHEM(CAM)")
+    assert res.items[0]["material_code"] == "BT-0009"
+
+
+def test_case_and_spacing_do_not_matter():
+    res = uv.validate(rows(("  alpha-amylase  -  direct 5x5mL ", 1, "")),
+                      NIDX, **SCOPE)
+    assert not res.blocked
+
+
+def test_a_name_shared_by_two_packs_of_one_supplier_blocks():
+    res = uv.validate(rows(("HBs Ag", 2, "")), NIDX, **SCOPE)
+    assert statuses(res) == [uv.STATUS_AMBIGUOUS_NAME]
+    assert res.blocked
+
+
+def test_a_list_that_does_not_exist_blocks_rather_than_falling_back():
+    """G5 is a locked cell, but it is now an input to resolution, so an
+    invented list has to stop rather than quietly search the whole master."""
+    res = uv.validate(rows(("ALBUMIN (Std Inc) (1x250mL)", 1, "")), NIDX,
+                      template_category=uv.CAT_REAGENT,
+                      template_supplier="NOT A SUPPLIER")
+    assert statuses(res) == [uv.STATUS_UNKNOWN_LIST]
+
+
+def test_a_code_still_resolves_so_v1_templates_keep_working():
+    res = uv.validate(rows(("CMLRE00002", 1, "")), NIDX, **SCOPE)
+    assert not res.blocked
+    assert res.items[0]["item"] == "alpha-AMYLASE - DIRECT 5x5mL"
+
+
+def test_the_same_item_named_twice_is_one_duplicate_line():
+    res = uv.validate(rows(("ALBUMIN (Std Inc) (1x250mL)", 1, ""),
+                           ("albumin (std inc) (1x250mL)", 2, "")), NIDX, **SCOPE)
+    assert statuses(res) == [uv.STATUS_OK, uv.STATUS_DUPLICATE_LINE]
+
+
+def test_a_name_and_its_own_code_on_two_rows_is_also_a_duplicate_line():
+    res = uv.validate(rows(("ALBUMIN (Std Inc) (1x250mL)", 1, ""),
+                           ("CMLRE00001", 2, "")), NIDX, **SCOPE)
+    assert statuses(res) == [uv.STATUS_OK, uv.STATUS_DUPLICATE_LINE]
+
+
+def test_an_unknown_name_says_so_without_guessing():
+    res = uv.validate(rows(("ALBUMIN STANDARD", 1, "")), NIDX, **SCOPE)
+    assert statuses(res) == [uv.STATUS_NOT_FOUND]
+
+
+def test_a_priceless_row_is_off_the_template_but_still_blocks_if_typed():
+    assert all(r["material_code"] != "CMLRE00005"
+               for r in uv.orderable_rows(NIDX, uv.CAT_REAGENT, "BOM CO.,LTD"))
+    res = uv.validate(rows(("TBC REAGENT", 1, "")), NIDX, **SCOPE)
+    assert statuses(res) == [uv.STATUS_NO_PRICE]
+
+
+def test_orderable_rows_offers_only_what_a_name_can_identify():
+    offered = [r["item"] for r in
+               uv.orderable_rows(NIDX, uv.CAT_REAGENT, "BOM CO.,LTD")]
+    # HBs Ag: name shared by two packs. TBC REAGENT: no price. Sorted by name.
+    assert offered == ["ALBUMIN (Std Inc) (1x250mL)",
+                       "alpha-AMYLASE - DIRECT 5x5mL"]

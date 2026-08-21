@@ -135,7 +135,8 @@ async def _send_template(q, context, idx):
 
     caption = (f"{CATEGORY_LABEL[category]} template for {html.escape(supplier)} "
                f"\u2014 {built['n_items']} items.\n"
-               f"Fill in the shaded cells only: code, quantity, note. "
+               f"Fill in the shaded cells only: item, quantity, note. Pick the "
+               f"item from the drop-down list \u2014 the code fills itself in. "
                f"Maximum {MAX_LINES} lines.")
     if built.get("n_no_price"):
         caption += (f"\n\n{built['n_no_price']} item(s) are left out because they "
@@ -144,6 +145,11 @@ async def _send_template(q, context, idx):
         caption += (f"\n\n{built['n_excluded']} item(s) are not available right "
                     f"now: their codes appear more than once in the master list. "
                     f"Tell me if you need one of them.")
+    if built.get("n_excluded_names"):
+        caption += (f"\n\n{built['n_excluded_names']} item(s) are left out "
+                    f"because two rows share one name on this supplier's list \u2014 "
+                    f"usually the same product in two pack sizes, so the name "
+                    f"cannot say which is meant. Tell me if you need one of them.")
     await context.bot.send_document(
         chat_id=q.message.chat_id, document=built["bytes"],
         filename=built["filename"], caption=caption,
