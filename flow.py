@@ -135,10 +135,82 @@ def can_reject(stage):
     return stage in REJECT_STAGES
 
 
-# Stages that hold an approval decision. Receiving is execution, not approval:
-# it cannot reject a PO back to the requester, only report a discrepancy, so it
-# is deliberately absent here.
+# Stages that hold an approval decision, in the order a PO passes through them.
+# Receiving is execution, not approval: it cannot reject a PO back to the
+# requester, only report a discrepancy, so it is deliberately absent here.
+# The ORDER is load-bearing -- rejection_notices slices it to work out which
+# stages sit below the one that rejected.
 APPROVAL_STAGES = (STAGE_STOCK, STAGE_BOOK, STAGE_FIN, STAGE_GM, STAGE_BOARD)
+
+
+# What each stage is left holding when a PO it already signed off is rejected.
+# This is the whole reason these groups are told at all: a rejection three
+# stages up leaves real work behind -- a purchase order sitting in QBO, a shelf
+# counted for an order that is not going out, an approval that will have to be
+# given again.
+REJECT_FOLLOWUP = {
+    "stock": ("Your count stays on file. If it comes back you will be asked to "
+              "count again, because the quantities may have changed."),
+    "book": "You had already booked this one — void the QBO purchase order.",
+    "fin": ("You had already approved this one. It re-runs from the Stock "
+            "controller, so it will come back to you."),
+    "gm": ("You had already approved this one. It re-runs from the Stock "
+           "controller, so it will come back to you."),
+}
+# Told that it happened, but never why. The stock controller is price-blind by
+# design, and a rejection reason is very often a price -- "too expensive", "we
+# can get it cheaper elsewhere". Handing him the reason would walk a figure
+# back into the one seat this whole flow keeps prices out of, through the door
+# marked audit trail. Bookkeeping is held to the same rule so there is one
+# rule, not an exception someone has to remember. Finance and the GM are not on
+# this list: they approve on price and already see every figure.
+REASON_BLIND = ("stock", "book")
+
+
+def rejection_notices(po, po_no, stage, by, reason=""):
+    """Who is told that a PO was rejected, and what each of them is told.
+
+    Pure: returns [{'chat', 'with_reason', 'text'}] for the caller to send, so
+    the routing rules can be tested without a Telegram client.
+
+    Two rules decide the list, and the ordering group on top of them:
+
+      * BELOW the stage that rejected, never above. A stage above has not seen
+        this PO, has nothing to undo, and telling it is noise. The rejecting
+        stage itself is excluded too -- it is the one that tapped the button
+        and watched its own card change.
+      * and only if it ACTUALLY ACTED. In the ordinary run of things that is
+        implied by being below, but a sign-off is the honest test of whether
+        there is anything to undo, so it is checked rather than assumed.
+
+    Everyone on the list gets the reason except REASON_BLIND.
+    """
+    head = (f"❌ PO #{po_no} · {po.get('supplier', '')} was rejected "
+            f"at {STAGE_LABEL[stage]} by {by}.")
+    reason = str(reason or "").strip()
+    said = (f"Reason: {reason}" if reason else "No reason was given.")
+    out = [{
+        "chat": "approved",
+        "with_reason": True,
+        "text": (head + "\n" + said
+                 + "\nIt has gone back to the requester — do not order it."),
+    }]
+    below = (APPROVAL_STAGES[:APPROVAL_STAGES.index(stage)]
+             if stage in APPROVAL_STAGES else ())
+    for key in below:
+        by_col, at_col = STAGE_AUDIT[key]
+        if not str(po.get(by_col, "")).strip():
+            continue
+        when = str(po.get(at_col, "")).strip()
+        tells = key not in REASON_BLIND
+        out.append({
+            "chat": key,
+            "with_reason": tells,
+            "text": (head + (f"\nYou handled it on {when}." if when else "")
+                     + ("\n" + said if tells else "")
+                     + "\n" + REJECT_FOLLOWUP[key]),
+        })
+    return out
 
 
 def positive_action(stage):

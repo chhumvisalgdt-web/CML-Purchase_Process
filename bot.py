@@ -263,19 +263,55 @@ async def cmd_mypos(update, context):
     await update.message.reply_text("\n".join(lines))
 
 
+SHOW_MAX = 40
+
+
+def _listing(title, entries):
+    out = [title, ""]
+    out += [f"  {e}" for e in entries[:SHOW_MAX]]
+    if len(entries) > SHOW_MAX:
+        out.append(f"  \u2026 and {len(entries) - SHOW_MAX} more")
+    return out
+
+
 async def cmd_mastercheck(update, context):
-    """List codes duplicated across the two master tabs. Such a code cannot
-    identify one item, so it is unorderable until the sheet is corrected."""
+    """Two ways the master list can fail to identify one item.
+
+    A duplicated CODE cannot identify one row, so it is unorderable today. A
+    repeated NAME inside one supplier's list cannot either -- and that matters
+    as soon as the requester's form asks for the item by name rather than by
+    code, because it is the name she picks. Reported separately, because they
+    are different faults with different fixes: a code collision is a typo, a
+    repeated name is usually the same product in two pack sizes and wants the
+    pack putting into the name.
+    """
     index = await upload_handlers.master_index()
-    if not index.dup_codes:
+    clashes = index.clashing_names()
+    if not index.dup_codes and not clashes:
         await update.message.reply_text(
-            f"No duplicate codes. {len(index.by_code)} item(s) orderable.")
+            f"No duplicate codes, and no item name repeated under one "
+            f"supplier. {len(index.by_code)} item(s) orderable.")
         return
-    lines = [f"{len(index.dup_codes)} duplicated code(s) \u2014 these cannot be "
-             f"ordered until the master list is fixed:", ""]
-    lines += [f"  {c}" for c in sorted(index.dup_codes)[:40]]
-    if len(index.dup_codes) > 40:
-        lines.append(f"  \u2026 and {len(index.dup_codes) - 40} more")
+
+    lines = []
+    if index.dup_codes:
+        lines += _listing(
+            f"{len(index.dup_codes)} duplicated code(s) \u2014 these cannot be "
+            f"ordered until the master list is fixed:",
+            sorted(index.dup_codes))
+    if clashes:
+        if lines:
+            lines.append("")
+        lines += _listing(
+            f"{len(clashes)} item name(s) repeated under one supplier. The "
+            f"same name twice cannot say which item is meant \u2014 usually one "
+            f"product in two pack sizes. Put the pack in the name to separate "
+            f"them:",
+            [f"{sup} \u2014 {name}" for sup, name in clashes])
+        lines.append("")
+        lines.append("Names repeated across DIFFERENT suppliers are not "
+                     "listed: that is how an equivalent is declared, and it "
+                     "is working as intended.")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -377,9 +413,9 @@ async def on_callback(update, context):
         # so the keyboard just tapped is stale the moment it is used. Left in
         # place it invites a second tap: "Confirm & send" still sitting under a
         # PO that was already created reads as if the send had not happened.
-        # The approval path is excluded -- _ack_edit clears those, and a Reject
-        # awaiting its reason deliberately keeps its buttons live so the PO can
-        # still be acted on if no reason ever comes.
+        # The approval path is excluded because _ack_edit clears those buttons
+        # itself -- on approval and on rejection alike, both of which are final
+        # the moment they are tapped.
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -660,18 +696,72 @@ async def _cb_action(q, context, data):
                 f"Now at: {flow.STAGE_LABEL.get(landed, landed)}.")
     elif act == "no":
         await q.answer()
-        prompt = await q.message.reply_text(
-            f"{fullname(user)}, *reply to this message* with the reason for "
-            f"rejecting PO #{po_no}.\n\nNothing is rejected until you do.",
-            parse_mode=ParseMode.MARKDOWN)
-        # Keyed by the prompt's own message id, so two rejections can be
-        # outstanding in one group at once. A single slot meant the second
-        # Reject silently discarded the first, leaving that PO parked at its
-        # stage with no record that anyone had tried to reject it.
-        context.chat_data.setdefault("await_reason", {})[prompt.message_id] = {
-            "po_no": po_no, "user_id": user.id, "stage": stage,
-            "card_id": q.message.message_id, "at": time.time(),
-        }
+        await _reject(context, q, po, po_no, stage, user)
+
+
+async def _reject(context, q, po, po_no, stage, user):
+    """Reject now. The reason is optional and comes afterwards, if at all.
+
+    This used to be two-phase: tapping Reject only posted a prompt, and the PO
+    was not rejected until a reason was replied. That left the buttons live on
+    a PO its approver had already refused -- so anyone could still approve it --
+    and a rejection could sit unrecorded for ever if the reason never came. A
+    boss who taps Reject has decided; making that decision wait on a sentence
+    he may never type recorded the opposite of what happened.
+    """
+    at = now_str()
+    await asyncio.to_thread(
+        sheets.update_po, po_no, stage=flow.STAGE_RETURNED, status="returned",
+        reject_stage=stage, reject_reason="", updated_at=at)
+
+    # _ack_edit re-sends the card without a reply_markup, which is what removes
+    # the keyboard -- the same way the approve path clears its buttons.
+    bits = [f"❌ Rejected by {html.escape(fullname(user))}"]
+    pos = flow.position(stage)
+    if pos:
+        bits.append(pos)
+    bits.append(at)
+    await _ack_edit(q, "\n\n" + "  |  ".join(bits))
+
+    await _notify_rejection(context, po, po_no, stage, user)
+    await _tell_requester_rejected(context, po, po_no, stage, user)
+
+    prompt = await q.message.reply_text(
+        f"❌ PO #{po_no} has been returned to "
+        f"{po.get('requester_name') or 'the requester'}.\n\n"
+        f"{fullname(user)} — if you want to give a reason, reply to this "
+        f"message. It is optional; the PO is already rejected.")
+    # Keyed by the prompt's own message id, so two rejections can be
+    # outstanding in one group at once. A single slot meant the second
+    # Reject silently discarded the first.
+    context.chat_data.setdefault("await_reason", {})[prompt.message_id] = {
+        "po_no": po_no, "user_id": user.id, "stage": stage,
+        "card_id": q.message.message_id, "at": time.time(),
+    }
+
+
+async def _notify_rejection(context, po, po_no, stage, user, reason=""):
+    """Tell the ordering group, and every stage that had already signed off.
+    Who hears what is decided by flow.rejection_notices; this only sends it."""
+    for note in flow.rejection_notices(po, po_no, stage, fullname(user), reason):
+        await _tell(context, note["chat"], note["text"])
+
+
+async def _tell_requester_rejected(context, po, po_no, stage, user, reason=""):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✏️ Edit & resubmit", callback_data=f"ed:{po_no}")]])
+    # Plain text, no parse mode: a name or a reason containing * or _ would
+    # otherwise either break the send or silently eat characters.
+    body = (f"❌ PO #{po_no} was rejected at {flow.STAGE_LABEL[stage]} by "
+            f"{fullname(user)}.\n\n"
+            + (f"Reason: {reason}" if reason else "No reason was given.")
+            + "\n\nFix it and resubmit — it will re-run from the Stock "
+              "controller.")
+    try:
+        await context.bot.send_message(chat_id=int(po["requester_id"]),
+                                       text=body, reply_markup=kb)
+    except Exception as e:
+        log.warning("Could not DM requester on reject: %s", e)
 
 
 async def stock_checked(context, po_no, user):
@@ -697,14 +787,21 @@ async def stock_checked(context, po_no, user):
     return "advanced"
 
 
-async def _tell_finance(context, text):
-    cid = Config.CHAT_IDS.get("fin")
+async def _tell(context, chat_key, text):
+    """Plain message to one configured group. A group with no chat ID is
+    skipped rather than raising -- a missing notification must never take down
+    the action that produced it."""
+    cid = Config.CHAT_IDS.get(chat_key)
     if not cid:
         return
     try:
         await context.bot.send_message(chat_id=cid, text=text)
     except Exception as e:
-        log.warning("Could not notify finance: %s", e)
+        log.warning("Could not notify %s: %s", chat_key, e)
+
+
+async def _tell_finance(context, text):
+    await _tell(context, "fin", text)
 
 
 async def _tell_stock_to_receive(context, po_no):
@@ -721,12 +818,15 @@ async def _tell_stock_to_receive(context, po_no):
         log.warning("Could not notify stock group: %s", e)
 
 
+# Short enough to be optional, long enough to be worth storing. "ok" tells the
+# requester nothing, and the PO is already rejected either way, so there is
+# nothing to gain by accepting it.
 MIN_REASON_CHARS = 3
 # How long a Reject prompt will accept a plain message as its answer. After
 # that only a real reply counts. Prompts are never chased and never expire --
 # a boss who taps Reject and says nothing is entitled to -- so without this
-# window an unrelated "ok thanks" replied into the group a week later would be
-# filed as the reason and reject the PO.
+# window an unrelated "ok thanks" typed into the group a week later would be
+# filed as that rejection's reason and sent on to the requester.
 REASON_FRESH_SECONDS = 3600
 
 
@@ -772,39 +872,46 @@ async def _maybe_capture_reason(update, context):
     if not pend:
         return
     reason = update.message.text.strip()
-    # A blank or one-character reply used to be stored verbatim, so the audit
-    # trail carried a rejection with no stated cause. The prompt stays open.
     if len(reason) < MIN_REASON_CHARS:
         await update.message.reply_text(
-            f"A reason of at least {MIN_REASON_CHARS} characters is required. "
-            f"PO #{pend['po_no']} has not been rejected \u2014 reply again with "
-            f"the reason.")
+            f"That is too short to be worth recording. PO #{pend['po_no']} is "
+            f"already rejected \u2014 reply again if you want to give a reason.")
         return
     po_no, stage = pend["po_no"], pend["stage"]
-    pending.pop(key, None)
     po = await asyncio.to_thread(sheets.get_po, po_no)
-    if not po or po.get("stage") != stage:
-        await update.message.reply_text("This PO was already processed.")
+    # The rejection already happened; this only fills in WHY. If the requester
+    # has since resubmitted, the PO is active again at the Stock controller and
+    # writing a reason onto it now would label a live PO as rejected.
+    if (not po or str(po.get("status", "")).strip() != "returned"
+            or str(po.get("reject_stage", "")).strip() != stage):
+        pending.pop(key, None)
+        await update.message.reply_text(
+            f"PO #{po_no} has already moved on, so that reason was not "
+            f"recorded.")
         return
-    await asyncio.to_thread(sheets.update_po, po_no, stage=flow.STAGE_RETURNED, status="returned",
-                            reject_stage=stage, reject_reason=reason, updated_at=now_str())
+    pending.pop(key, None)
+    await asyncio.to_thread(sheets.update_po, po_no, reject_reason=reason,
+                            updated_at=now_str())
     await update.message.reply_text(
-        f"\u274c PO #{po_no} rejected at {flow.STAGE_LABEL[stage]}. The requester has been notified.")
+        f"Reason recorded on PO #{po_no}, and sent to the requester.")
+    # The same list and the same rule as the rejection itself: whoever was
+    # allowed to see a reason then is who hears it now. Asking
+    # rejection_notices rather than keeping a second list here means the stock
+    # controller cannot start receiving reasons because someone edited one of
+    # two places.
+    for note in flow.rejection_notices(po, po_no, stage,
+                                       fullname(update.effective_user), reason):
+        if note["with_reason"]:
+            await _tell(context, note["chat"],
+                        f"PO #{po_no} \u00b7 {po.get('supplier', '')} \u2014 reason for "
+                        f"the rejection at {flow.STAGE_LABEL[stage]}: {reason}")
     try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=update.effective_chat.id, message_id=pend["card_id"], reply_markup=None)
-    except Exception:
-        pass
-    try:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("\u270f\ufe0f Edit & resubmit", callback_data=f"ed:{po_no}")]])
         await context.bot.send_message(
             chat_id=int(po["requester_id"]),
-            text=(f"\u274c PO #{po_no} was rejected at *{flow.STAGE_LABEL[stage]}* by "
-                  f"{fullname(update.effective_user)}.\n\nReason: {reason}\n\n"
-                  f"Fix it and resubmit \u2014 it will re-run from the Stock controller."),
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            text=(f"PO #{po_no} \u2014 reason for the rejection at "
+                  f"{flow.STAGE_LABEL[stage]}:\n\n{reason}"))
     except Exception as e:
-        log.warning("Could not DM requester on reject: %s", e)
+        log.warning("Could not DM requester with the reason: %s", e)
 
 
 # ===================== bootstrap =====================

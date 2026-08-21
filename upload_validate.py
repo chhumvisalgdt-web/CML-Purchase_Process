@@ -156,6 +156,22 @@ class MasterIndex:
     # none of them were his.
     dup_where: dict = field(default_factory=dict)
 
+    # (category, supplier, normalised name) -> the one row that name identifies
+    # inside that supplier's list.
+    #
+    # The supplier is part of the key because names are deliberately NOT unique
+    # across suppliers: two rows are DECLARED equivalent precisely by carrying
+    # the same CML Reagent name, which is what feeds "Also sold by" and the
+    # alternatives table. A name is therefore only ever an identifier within
+    # one supplier's list, never on its own.
+    by_name: dict = field(default_factory=dict)
+    # Keys whose name appears more than once inside ONE supplier's list --
+    # usually the same product in two pack sizes. Such a name cannot identify
+    # one row, so it is dropped from by_name exactly as a duplicated code is
+    # dropped from by_code: unusable, not guessable. Maps to the name as
+    # written, for reporting.
+    dup_names: dict = field(default_factory=dict)
+
     def suppliers(self, category=None):
         out, seen = [], set()
         for row in self.by_code.values():
@@ -206,12 +222,40 @@ class MasterIndex:
         return sum(1 for where in self.dup_where.values()
                    if (category, supplier) in where)
 
+    def item(self, category, supplier, name):
+        """The one row a name identifies inside one supplier's list, or None."""
+        return self.by_name.get((category, supplier, norm_name(name)))
+
+    def name_is_ambiguous(self, category, supplier, name):
+        return (category, supplier, norm_name(name)) in self.dup_names
+
+    def has_scope(self, category, supplier):
+        """Whether this category+supplier names a list that actually exists.
+        A form that identifies its rows by name is only meaningful inside one
+        such list, so an unknown pair has to block rather than fall back."""
+        return any(c == category and s == supplier for c, s, _n in self.by_name)
+
+    def excluded_names_for(self, category, supplier):
+        return sum(1 for c, s, _n in self.dup_names
+                   if (c, s) == (category, supplier))
+
+    def clashing_names(self):
+        """[(supplier, name)] for every name that cannot identify one item
+        inside its own supplier's list. Feeds /mastercheck.
+
+        Names repeated ACROSS suppliers are absent on purpose: that is not a
+        fault, it is how equivalence is declared.
+        """
+        return sorted({(s, written)
+                       for (_c, s, _n), written in self.dup_names.items()})
+
 
 def build_index(reagent_rows, other_rows):
     """reagent_rows / other_rows: dicts with material_code, item, supplier,
     unit_price, and optionally pack and supplier_reagent."""
     by_code, dup, first_seen = {}, set(), {}
     best, dup_where = {}, {}
+    by_name, dup_names = {}, {}
     for rows, category in ((reagent_rows, CAT_REAGENT), (other_rows, CAT_OTHER)):
         for raw in rows:
             code = norm_code(raw.get("material_code"))
@@ -236,16 +280,35 @@ def build_index(reagent_rows, other_rows):
             if code in first_seen:
                 dup.add(code)
                 by_code.pop(code, None)
+                seen = first_seen[code]
+                # The row that claimed this code FIRST is unusable too, and it
+                # was indexed by name before the collision came to light. Drop
+                # it from there as well, or an unusable row stays reachable by
+                # the one route the requester's form actually uses -- usable by
+                # name, unorderable by code, which is the worst of both.
+                by_name.pop((seen["category"], seen["supplier"],
+                             norm_name(seen["item"])), None)
                 # Remember every place this code claimed to live -- the first
                 # row's home as well as this one -- so a template can say how
                 # many of ITS items went missing.
-                seen = first_seen[code]
                 dup_where.setdefault(code, set()).add(
                     (seen["category"], seen["supplier"]))
                 dup_where[code].add((category, row["supplier"]))
                 continue
             first_seen[code] = row
             by_code[code] = row
+
+            # Name index, scoped to one supplier's list. A row whose CODE is
+            # duplicated never reaches here: it is unusable, and an unusable
+            # row must not be reachable by a second route either.
+            nkey = (category, row["supplier"], norm_name(row["item"]))
+            if nkey[2]:
+                if nkey in by_name or nkey in dup_names:
+                    dup_names[nkey] = by_name.get(nkey, {}).get(
+                        "item", row["item"]) or row["item"]
+                    by_name.pop(nkey, None)
+                else:
+                    by_name[nkey] = row
 
             price = row["unit_price"]
             if price is not None and price > 0 and row["item"]:
@@ -255,7 +318,8 @@ def build_index(reagent_rows, other_rows):
                 if sup and (sup not in cur or price < cur[sup]):
                     cur[sup] = price
     return MasterIndex(by_code=by_code, dup_codes=dup, best_by_item=best,
-                       dup_where=dup_where)
+                       dup_where=dup_where, by_name=by_name,
+                       dup_names=dup_names)
 
 
 def cheaper_alternative(code, index):

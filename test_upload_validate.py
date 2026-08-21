@@ -165,6 +165,72 @@ def test_excluded_count_is_scoped_to_the_template():
     assert idx.excluded_for(uv.CAT_REAGENT, "Beta") == 0
 
 
+# ---- names as identifiers (does the requester's form dare ask for one?) ----
+
+def test_a_name_identifies_one_row_inside_one_suppliers_list():
+    row = IDX.item(uv.CAT_REAGENT, "BOM CO.,LTD", "ALBUMIN (Std Inc) (1x250mL)")
+    assert row["material_code"] == "11573"
+    assert IDX.item(uv.CAT_REAGENT, "BIO-TECHEM(CAM)",
+                    "ALBUMIN (Std Inc) (1x250mL)")["material_code"] == "BT-0001"
+
+
+def test_the_same_name_under_two_suppliers_is_not_a_clash():
+    """It is the opposite of a fault: identical names are how an equivalent is
+    declared, and both rows stay orderable."""
+    assert IDX.clashing_names() == []
+    assert not IDX.name_is_ambiguous(uv.CAT_REAGENT, "BOM CO.,LTD",
+                                     "ALBUMIN (Std Inc) (1x250mL)")
+
+
+def test_lookup_by_name_ignores_case_and_spacing():
+    assert IDX.item(uv.CAT_REAGENT, "BOM CO.,LTD",
+                    "  albumin (std inc)   (1x250mL) ")["material_code"] == "11573"
+
+
+def test_the_same_name_twice_under_one_supplier_is_a_clash():
+    """One product in two pack sizes. The name can no longer say which is
+    meant, so it identifies nothing -- the same rule a duplicated code gets."""
+    clash = [
+        {"material_code": "P-40", "item": "HBs Ag", "supplier": "Borey",
+         "pack": "40/Kit", "unit_price": 18.5},
+        {"material_code": "P-50", "item": "HBs Ag", "supplier": "Borey",
+         "pack": "50/Kit", "unit_price": 18.5},
+        {"material_code": "P-99", "item": "Dengue NS1", "supplier": "Borey",
+         "pack": "25 Tests", "unit_price": 74.8},
+    ]
+    idx = uv.build_index(clash, [])
+    assert idx.clashing_names() == [("Borey", "HBs Ag")]
+    assert idx.name_is_ambiguous(uv.CAT_REAGENT, "Borey", "hbs ag")
+    assert idx.item(uv.CAT_REAGENT, "Borey", "HBs Ag") is None
+    # Both codes stay perfectly good; it is only the NAME that is unusable.
+    assert idx.by_code["P-40"]["pack"] == "40/Kit"
+    assert idx.excluded_names_for(uv.CAT_REAGENT, "Borey") == 1
+    assert idx.item(uv.CAT_REAGENT, "Borey", "Dengue NS1")["material_code"] == "P-99"
+
+
+def test_a_third_row_with_the_same_name_does_not_resurrect_it():
+    same = [{"material_code": f"P-{i}", "item": "HBs Ag", "supplier": "Borey",
+             "unit_price": 1.0} for i in range(3)]
+    idx = uv.build_index(same, [])
+    assert idx.item(uv.CAT_REAGENT, "Borey", "HBs Ag") is None
+    assert len(idx.clashing_names()) == 1
+
+
+def test_a_duplicated_code_is_not_reachable_by_name_either():
+    """ZD 3001-0104-2 is two different products. Both rows are unusable, so
+    neither may come back through the name index."""
+    assert IDX.item(uv.CAT_REAGENT, "BIO-TECHEM(CAM)", "Anti-CCD Absorbent") is None
+    assert IDX.item(uv.CAT_REAGENT, "BIO-TECHEM(CAM)",
+                    "EUROLINE ANA Profile 1 (IgG)") is None
+
+
+def test_has_scope_knows_a_real_list_from_an_invented_one():
+    assert IDX.has_scope(uv.CAT_REAGENT, "BOM CO.,LTD")
+    assert IDX.has_scope(uv.CAT_OTHER, "BOM CO.,LTD")
+    assert not IDX.has_scope(uv.CAT_REAGENT, "NOT A SUPPLIER")
+    assert not IDX.has_scope(uv.CAT_OTHER, "BIO-TECHEM(CAM)")
+
+
 # ---- cross-supplier alternatives ----
 ALT_MASTER = [
     {"material_code": "CMLRE00016", "item": "HBs Ag (25 Tests)",
@@ -366,3 +432,89 @@ def test_replying_to_a_stale_prompt_still_works():
     """The boss is entitled to take his time; he just has to point at it."""
     _, e, err = _bot.pick_rejection(STALE, 7, 101, now=NOW)
     assert e["po_no"] == "190" and not err
+
+
+# ---- who is told when a PO is rejected ----
+import flow as _f  # noqa: E402
+
+# At the Board, so on the non-urgent path everything below it has signed off.
+REJECTED_PO = {
+    "po_no": "187", "supplier": "BIO-TECHEM(CAM)", "requester_name": "Sophea",
+    "stock_by": "Dara", "stock_at": "19-Aug-2026 09:12",
+    "book_by": "Lina", "book_at": "20-Aug-2026 14:40",
+    "fin_by": "Mr. Sok", "fin_at": "21-Aug-2026 10:02",
+    "gm_by": "Mr. Ny", "gm_at": "21-Aug-2026 11:30",
+}
+SECRET = "too expensive, 40% cheaper at Borey Pharma"
+
+
+def _by_chat(po, stage="board", reason=SECRET):
+    return {n["chat"]: n for n in
+            _f.rejection_notices(po, "187", stage, "Mr. Chan", reason)}
+
+
+def test_ordering_group_is_always_told_and_gets_the_reason():
+    n = _by_chat(REJECTED_PO)["approved"]
+    assert SECRET in n["text"] and n["with_reason"]
+    assert "do not order it" in n["text"].lower()
+
+
+def test_stock_and_bookkeeping_are_told_but_never_the_reason():
+    """The stock controller is price-blind. A rejection reason is very often a
+    price, so it must not reach him through the notification either."""
+    got = _by_chat(REJECTED_PO)
+    for key in ("stock", "book"):
+        assert key in got, f"{key} signed off and must be told"
+        assert SECRET not in got[key]["text"]
+        assert "Reason" not in got[key]["text"]
+        assert not got[key]["with_reason"]
+
+
+def test_bookkeeping_is_told_to_void_the_qbo_order():
+    assert "QBO" in _by_chat(REJECTED_PO)["book"]["text"]
+
+
+def test_finance_and_gm_are_told_and_do_get_the_reason():
+    """They approve on price and see every figure already, so withholding it
+    from them would only make the chase harder."""
+    got = _by_chat(REJECTED_PO)
+    for key in ("fin", "gm"):
+        assert key in got and got[key]["with_reason"]
+        assert SECRET in got[key]["text"]
+
+
+def test_stages_above_the_rejecter_are_never_told():
+    """Finance rejects: the GM has not seen this PO and has nothing to undo."""
+    got = _by_chat(REJECTED_PO, stage="fin")
+    assert set(got) == {"approved", "stock", "book"}
+
+
+def test_the_rejecting_stage_is_not_told_about_its_own_rejection():
+    assert "gm" not in _by_chat(REJECTED_PO, stage="gm")
+
+
+def test_a_stage_that_never_acted_is_not_told():
+    """Reject at Finance and bookkeeping may not have booked it yet -- there is
+    nothing to undo, so the message would be noise."""
+    po = dict(REJECTED_PO, book_by="", book_at="")
+    got = _by_chat(po, stage="fin")
+    assert "stock" in got and "book" not in got
+
+
+def test_nobody_below_is_told_when_nobody_below_acted():
+    po = dict(REJECTED_PO, stock_by="", stock_at="", book_by="", book_at="")
+    assert set(_by_chat(po, stage="fin")) == {"approved"}
+
+
+def test_a_blank_reason_says_so_rather_than_leaving_a_gap():
+    """The reason is optional now, so the notice has to be honest about it."""
+    for blank in ("", None, "   "):
+        n = _by_chat(REJECTED_PO, reason=blank)["approved"]
+        assert "No reason was given." in n["text"]
+        assert "Reason:" not in n["text"]
+
+
+def test_every_notice_names_the_po_and_the_rejecting_stage():
+    for n in _f.rejection_notices(REJECTED_PO, "187", "board", "Mr. Chan", ""):
+        assert "#187" in n["text"]
+        assert "Board of director" in n["text"]

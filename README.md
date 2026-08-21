@@ -86,9 +86,34 @@ Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00
 
 A cancelled quantity stops being expected everywhere at once: it drops off the receipt file, the 7th unit against a 10-line with 4 cancelled is flagged as over-receipt, and a PO whose whole remainder is cancelled closes. There is one definition of "still owed" — `ordered − cancelled − received` — and the review list and the receiving path both use it.
 
+### Rejection
+
 **Only the Finance manager, the GM and the Board can reject.** Rejecting is a spending decision, and the two stages below Finance are not spending roles — the stock controller is price-blind and counts the shelf, bookkeeping confirms a price and books it. "We already have plenty" belongs in the stock count, where the price-visible approvers can see the number, rather than in a veto that removes the evidence and settles the question before they ever see it.
 
-Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier copy); page 2 is the internal approval trail. A reject at any stage returns the PO to the requester with the reason; after they fix it, the PO **re-runs from the Stock controller** with every earlier sign-off cleared.
+**Tapping Reject is the rejection.** The buttons disappear, the PO is returned to the requester, and everyone who needs to know is told, all in that moment. It is not two-phase: a boss who taps Reject has decided, and making that decision wait on a sentence he may never type recorded the opposite of what had happened — the PO sat at its stage with live buttons, approvable by anyone.
+
+**A reason is optional.** The bot offers one — reply to its message in the group — and a reason given later is written to the PO and forwarded on. Give none and the record says *no reason was given*, which is at least true.
+
+Who hears about it:
+
+| Told | Gets the reason | When |
+|---|---|---|
+| Requester (DM) | Yes | Always — carries the **Edit & resubmit** button |
+| Approved POs group | Yes | Always |
+| Finance manager | Yes | If it had already approved |
+| General manager | Yes | If it had already approved |
+| Bookkeeping | **No** | If it had already booked — void the QBO purchase order |
+| Stock controller | **No** | If it had already counted — the count stays on file |
+
+Two rules decide that list. **Below the rejecting stage, never above** — a stage above has not seen the PO, has nothing to undo, and telling it is noise; the rejecter is excluded too, since it watched its own card change. **And only if it actually signed off**, which is the honest test of whether there is anything left to undo.
+
+So a rejection at Finance reaches the stock controller and bookkeeping, and stops there. A rejection at the Board reaches all four.
+
+Stock and bookkeeping are told **that** it was rejected, never **why**. A rejection reason is very often a price — *"too expensive"*, *"we can get it cheaper"* — and handing that to the price-blind stock controller would walk a figure back into the one seat the whole flow keeps prices out of, through the door marked audit trail. Bookkeeping follows the same rule so there is one rule rather than an exception someone has to remember. Finance and the GM approve on price and see every figure already, so withholding it from them would only make the chase harder — and `/pending` cannot show a returned PO, so this message is the only way Finance learns that something it approved was thrown out above it.
+
+A reason given later follows exactly the same list — `flow.rejection_notices` decides both, so the stock controller cannot start receiving reasons because someone edited one of two places.
+
+Every stage receives the PO as a 2-page PDF. Page 1 is the order (the supplier copy); page 2 is the internal approval trail. After the requester fixes it, the PO **re-runs from the Stock controller** with every earlier sign-off cleared.
 
 ## The Excel upload path
 
@@ -189,7 +214,10 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `post_handlers.py` — Telegram wiring for the post-approval stages
 - `group_handlers.py` — per-group command cards, pinning, and the finance chase list
 - `clock.py` — the single timezone-aware clock every timestamp comes from
-- `test_upload_validate.py`, `test_receipt_validate.py` — 58 tests
+- `test_upload_validate.py`, `test_receipt_validate.py` — pure validation, and
+  the rejection routing rules; 79 tests
+- `test_reject_flow.py` — the rejection path end to end, with Sheets and
+  Telegram replaced by recorders; 12 tests
 
 ## Before first use
 
