@@ -81,6 +81,83 @@ Approved orders are dated for when they can actually be sent: **Mon–Sat, 08:00
 - `Receipts` is append-only. A correction is a **negative row with a reason**, never an edit.
 - The **invoice number** is the delivery reference, since GRN/GDN paperwork is not common practice locally. `Receiving now` is deliberately not pre-filled from the invoice, so the number recorded is one that was counted.
 
+### Supporting documents (Other purchases)
+
+A reagent comes off a priced master list the approvers already trust. A one-off
+purchase of something nobody has bought before is the one where a quotation is
+worth seeing, so **`Other` POs are asked for supporting documents** after the
+reason and before the urgent flag: a quotation, a specification, a photo of the
+pump that failed. PDF, JPG, PNG, Excel or Word; up to `ATTACH_MAX_COUNT` files
+of `ATTACH_MAX_MB` each. Archives are refused -- a `.zip` is an unreviewable box
+and the approvers are being asked to review what is in front of them. Pictures
+must be sent **as files**, not as photos: Telegram's compression turns a
+quotation into a smear nobody can read the figures on.
+
+**Attaching is optional, and the absence is on the record.** Nothing is blocked
+by an empty list, but page 2 of an eligible PO prints *"No supporting document
+attached"* rather than staying silent. Blocking would have pushed people to
+attach anything at all to get past the gate, which produces files nobody reads
+and a control that measures compliance instead of evidence.
+
+#### Who can see them
+
+| Stage | Sees the attachment | Why |
+|---|---|---|
+| Stock controller | **No** | Price-blind, and a quotation is a price. Same rule as the rejection reason. |
+| Bookkeeping | Yes | It confirms the price with the supplier; the quotation is what it confirms against. |
+| Finance manager | Yes | Spending decision. |
+| General manager | Yes | Approves on price. |
+| Board of director | Yes | Approves on price. |
+| Approved POs | **No** | Its job is to forward documents to the supplier. A competitor's quotation in that thread is one tap from the supplier. |
+| Cash Advance | No | Payment routing, no review role. |
+
+`ATTACH_STAGES` configures the first five, but `stock`, `approved` and `cash`
+are **stripped in code** (`Config.attach_stages`, `attachments.NEVER`) whatever
+the variable says. A leak there would be one careless env var, so the ban does
+not live in a comment. `attachments.delivery_stages` is the single place that
+decides, and a configuration of nothing but banned stages delivers nothing --
+a misconfiguration degrades to silence, never to a leak.
+
+Files are collected in the DM but stored only once the PO number exists: an
+attachment with no PO to belong to is litter. Each is downloaded once,
+fingerprinted, archived, and thereafter **re-sent to each stage by Telegram
+`file_id`** rather than re-uploaded, so the four groups receive the identical
+file rather than four copies that could drift.
+
+#### The record
+
+`Attachments` is append-only, like `Receipts` and `Uploads`. One row per file:
+`sha256`, the Telegram `file_id`, the Drive `drive_url`, who attached it, and
+`delivered_to` -- written **as each stage actually receives it**, so a failed
+delivery leaves a gap rather than a lie. A replacement is a new row whose
+`supersedes` names the old one; nothing is ever edited over the top.
+
+The first 10 characters of the digest print next to the filename on page 2, so
+the file sitting in the Telegram group can be tied to the row in the sheet by
+eye. That fingerprint is the whole point: a year later it can prove that the
+file someone produces is the file the Board approved against.
+
+#### The Drive archive
+
+Telegram holds the file and `file_id` points at it -- right up to the day
+someone clears the chat history, after which `sha256` can still prove a file is
+*not* the original but cannot produce the original. `ATTACHMENTS_FOLDER_ID`
+closes that gap with a second copy in a folder the company owns, filed as
+`<year>/PO_<no>/PO_<no>_<n>_<original name>`.
+
+Two things make it safe to point at a personal Drive. The scope is
+**`drive.file`**, which grants access to files this application created plus
+whatever was explicitly shared with it -- one folder. Everything else in that
+Drive is invisible to the credential, enforced by Google rather than by the
+care of this code. And a service account has **no storage quota of its own**,
+which is why the folder must belong to a real account and be shared with the
+service account as Editor; a file created anywhere else simply fails.
+
+The archive **never gates a PO**. Every failure returns an empty `drive_url`,
+logs a warning once per distinct reason, and lets the order carry on. A
+purchase order that cannot reach the Finance manager because Google had a bad
+minute is a worse outcome than an archive with a visible hole in it.
+
 ### Cancellation (monthly)
 `/outstanding` in the Finance group lists every open line across all POs with a `Remove?` column. Removal cancels **only the un-received remainder** — a line at 6-of-10 cancels 4 and stays at 6 received. Lines are marked cancelled with a mandatory reason, never deleted: deleting would erase the evidence that the item was ever ordered.
 
@@ -211,6 +288,9 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `upload_validate.py` — pure validation, no I/O
 - `upload_excel.py` — template generation, workbook reading, validation report
 - `upload_handlers.py` — Telegram wiring for the upload path
+- `attachments.py` — supporting-document rules (who may see a file), pure
+- `attach_handlers.py` — Telegram wiring for the attach step and stage delivery
+- `drive.py` — the Google Drive archive; never gates a PO
 - `receipt_validate.py` / `receipt_excel.py` — goods receipt, pure + Excel layers
 - `side_excel.py` — stock count, price confirmation, cancellation review
 - `post_handlers.py` — Telegram wiring for the post-approval stages
@@ -218,6 +298,7 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `clock.py` — the single timezone-aware clock every timestamp comes from
 - `test_upload_validate.py`, `test_receipt_validate.py` — pure validation, and
   the rejection routing rules; 79 tests
+- `test_attachments.py` — attachment rules and the stage ban; 18 tests
 - `test_reject_flow.py` — the rejection path end to end, with Sheets and
   Telegram replaced by recorders; 12 tests
 

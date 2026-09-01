@@ -99,10 +99,18 @@ def _approval_rows(po):
 
 
 def generate_po_pdf(po, items, supplier_copy=False, show_prices=True,
-                    alternatives=None):
+                    alternatives=None, attachments=None):
     """show_prices=False renders a price-blind PDF (No/Code/Item/Pack/Qty only, no totals,
     no price-change note) — used for the Stock controller stage. The supplier copy always
     includes prices (it is the order document).
+
+    attachments: rows from sheets.get_attachments(), listed on page 2 of
+    price-visible copies. For a category that is meant to carry supporting
+    documents, an empty list prints "No supporting document attached" rather
+    than nothing -- attaching is optional, but the absence is a fact the
+    approvers are entitled to see, and a silence would have hidden it. The
+    price-blind stock controller copy omits the section entirely: a filename
+    is free text and "quotation_1200usd.pdf" is a price.
 
     alternatives: rows from upload_validate.alternatives_for(), printed under
     the order table on price-visible copies so Finance, the GM and the Board
@@ -393,6 +401,35 @@ def generate_po_pdf(po, items, supplier_copy=False, show_prices=True,
             pdf.set_text_color(0, 0, 0)
             for note in sel_notes:
                 pdf.multi_cell(0, 6, "  -  " + note, new_x="LMARGIN", new_y="NEXT")
+
+    # Supporting documents. Named, never embedded: page 2 is the approval
+    # trail and has to stay one readable page, and the files themselves
+    # arrive in the group alongside this PDF.
+    if show_prices:
+        _cat = str(po.get("category", "")).strip().lower()
+        _eligible = any(c in _cat for c in Config.ATTACH_CATEGORIES)
+        rows_att = list(attachments or [])
+        if rows_att or _eligible:
+            pdf.ln(2)
+            pdf.set_font(FONT, "", 11)
+            pdf.set_text_color(*GREY)
+            pdf.cell(0, 7, "Supporting documents:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+            if not rows_att:
+                pdf.set_text_color(*ORANGE)
+                pdf.multi_cell(0, 6, "  -  No supporting document attached.",
+                               new_x="LMARGIN", new_y="NEXT")
+                pdf.set_text_color(0, 0, 0)
+            for a in rows_att:
+                name = str(a.get("file_name", "")).strip() or "(unnamed file)"
+                # The first 10 characters of the digest are enough to tie the
+                # file in the group to the row in the sheet by eye.
+                sha = str(a.get("sha256", ""))[:10]
+                line = f"  -  {name}"
+                if sha:
+                    line += f"   [{sha}]"
+                pdf.multi_cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+
     pdf.ln(4)
 
     with pdf.table(

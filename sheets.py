@@ -80,6 +80,19 @@ STOCK_COUNT_HEADERS = [
     "counted_by", "counted_at",
 ]
 
+# Supporting documents attached by the requester for management review.
+# Append-only, like Receipts and Uploads: a replaced file is a NEW row whose
+# `supersedes` names the old one, never an edit over the top of it. `sha256`
+# is what makes the record worth having -- it can prove a year later that the
+# file produced is the file the Board approved against. `delivered_to` is
+# written as each stage actually receives the file, not when the bot intended
+# to send it, so a delivery that failed leaves a gap rather than a lie.
+ATTACHMENT_HEADERS = [
+    "attachment_id", "po_no", "seq", "uploaded_at", "uploaded_by",
+    "uploaded_by_id", "role", "file_name", "archive_name", "mime", "size",
+    "sha256", "file_id", "drive_url", "delivered_to", "supersedes",
+]
+
 
 def _to_float(v):
     if v is None:
@@ -176,6 +189,7 @@ class Sheets:
         self._ws("Upload_Rows", UPLOAD_ROW_HEADERS)
         self._ws("Receipts", RECEIPT_HEADERS)
         self._ws("Stock_Counts", STOCK_COUNT_HEADERS)
+        self._ws("Attachments", ATTACHMENT_HEADERS)
         # If the master list is meant to be in the main spreadsheet, make sure the tab exists.
         mid = Config.MASTER_SPREADSHEET_ID or Config.SPREADSHEET_ID
         if mid == Config.SPREADSHEET_ID:
@@ -621,6 +635,64 @@ class Sheets:
               "values": [[v]]} for k, v in vals.items() if v != ""],
             value_input_option="USER_ENTERED")
         return True
+
+
+    # ---- attachments ----
+    def log_attachments(self, po_no, rows):
+        """Write one row per attached file. Returns the ids written."""
+        if not rows:
+            return []
+        ws = self._ws("Attachments", ATTACHMENT_HEADERS)
+        stamp = clock.now_str("%d-%b-%Y %H:%M:%S")
+        out, values = [], []
+        base = int(time.time() * 1000)
+        for i, r in enumerate(rows):
+            aid = r.get("attachment_id") or f"A{base + i}"
+            r = dict(r, attachment_id=aid, po_no=po_no,
+                     uploaded_at=r.get("uploaded_at") or stamp)
+            out.append(aid)
+            values.append([r.get(h, "") for h in ATTACHMENT_HEADERS])
+        self._ensure_capacity(ws, len(values))
+        ws.append_rows(values, value_input_option="USER_ENTERED")
+        return out
+
+    def get_attachments(self, po_no):
+        ws = self._ws("Attachments", ATTACHMENT_HEADERS)
+        want = str(po_no).strip()
+        out = []
+        for r in ws.get_all_records(expected_headers=ATTACHMENT_HEADERS):
+            if str(r.get("po_no", "")).strip() == want:
+                out.append({k: r.get(k, "") for k in ATTACHMENT_HEADERS})
+        out.sort(key=lambda r: _to_float(r.get("seq")))
+        return out
+
+    def mark_delivered(self, po_no, stage):
+        """Record that a stage actually received this PO's attachments.
+
+        Written after the send succeeds, so the column answers "who has seen
+        this document" rather than "who was supposed to".
+        """
+        ws = self._ws("Attachments", ATTACHMENT_HEADERS)
+        col_po = ATTACHMENT_HEADERS.index("po_no") + 1
+        col_del = ATTACHMENT_HEADERS.index("delivered_to") + 1
+        want = str(po_no).strip()
+        reqs = []
+        po_col = ws.col_values(col_po)
+        del_col = ws.col_values(col_del)
+        for i, v in enumerate(po_col, start=1):
+            if i == 1 or str(v).strip() != want:
+                continue
+            cur = del_col[i - 1] if i - 1 < len(del_col) else ""
+            seen = [x for x in str(cur).split(",") if x.strip()]
+            if stage in seen:
+                continue
+            seen.append(stage)
+            reqs.append({"range": gspread.utils.rowcol_to_a1(i, col_del),
+                         "values": [[",".join(seen)]]})
+        if reqs:
+            ws.batch_update(reqs, value_input_option="USER_ENTERED")
+        return len(reqs)
+
 
 
 sheets = Sheets()

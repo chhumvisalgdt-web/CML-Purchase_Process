@@ -22,6 +22,8 @@ import side_excel
 import flow
 import upload_validate
 import upload_handlers
+import attach_handlers
+import attachments as att
 import post_handlers
 import group_handlers
 
@@ -108,6 +110,16 @@ async def _alternatives(items, show_prices=True):
         return []
 
 
+async def _attachments(po_no):
+    """Best-effort: the PDF names the supporting documents, but a Sheets hiccup
+    must not stop the PO reaching the group that has to approve it."""
+    try:
+        return await asyncio.to_thread(sheets.get_attachments, po_no)
+    except Exception as e:
+        log.warning("Could not read attachments for PO %s: %s", po_no, e)
+        return []
+
+
 async def post_stage(context, po_no):
     po = await asyncio.to_thread(sheets.get_po, po_no)
     if not po:
@@ -146,9 +158,20 @@ async def post_stage(context, po_no):
 
     show = True
     alts = await _alternatives(items, show)
+    atts = await _attachments(po_no)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items,
-                                  show_prices=show, alternatives=alts)
+                                  show_prices=show, alternatives=alts,
+                                  attachments=atts)
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{stage}.pdf", caption, parse, kb)
+
+    # Supporting documents follow the card, and only to the stages allowed to
+    # see them. The stock controller is excluded because a quotation is a
+    # price; the approved-PO group because its job is to forward documents to
+    # the supplier. Config.attach_stages() enforces that, so a mistyped env
+    # var cannot open either door.
+    if stage in att.delivery_stages(po.get("category", ""), Config.attach_stages()):
+        await attach_handlers.deliver(context, po_no, stage, po,
+                                      po.get("requester_name", ""))
 
 
 async def notify_group(context, po_no, chat_key, header, show_prices=True):
@@ -162,7 +185,8 @@ async def notify_group(context, po_no, chat_key, header, show_prices=True):
     caption, parse = _html_caption(text)
     alts = await _alternatives(items, show_prices)
     pdf = await asyncio.to_thread(generate_po_pdf, po, items,
-                                  show_prices=show_prices, alternatives=alts)
+                                  show_prices=show_prices, alternatives=alts,
+                                  attachments=await _attachments(po_no))
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{chat_key}.pdf", caption, parse)
 
 
@@ -214,7 +238,8 @@ async def _post_approved(context, po_no, po):
     await _send_pdf(context, chat_id, order, f"PO_{po_no}.pdf", caption, parse)
 
     approval = await asyncio.to_thread(generate_po_pdf, po, items,
-                                       alternatives=await _alternatives(items))
+                                       alternatives=await _alternatives(items),
+                                       attachments=await _attachments(po_no))
     try:
         await context.bot.send_document(
             chat_id=chat_id, document=approval,
@@ -369,9 +394,16 @@ async def _handle_po_reason(update, context):
     if not reason:
         await update.message.reply_text("Please type a short reason / purpose for this PO.")
         return
-    _draft(context)["reason"] = reason
+    draft = _draft(context)
+    draft["reason"] = reason
     context.user_data["state"] = None
-    await _ask_urgent(update.message)
+    # "Other" purchases carry their evidence. A reagent comes off a priced
+    # master list the approvers already trust; a one-off purchase of something
+    # nobody has bought before is the one where a quotation is worth seeing.
+    if attach_handlers.wanted(draft):
+        await attach_handlers.ask(update.message, context)
+    else:
+        await _ask_urgent(update.message)
 
 
 async def _handle_edit_qty(update, context):
@@ -512,6 +544,12 @@ async def _cb_confirm(q, context):
         }
         await asyncio.to_thread(sheets.create_po, po)
     await asyncio.to_thread(sheets.add_line_items, po_no, draft["items"])
+    # Read before user_data is cleared, stored after the PO row exists: an
+    # attachment with no PO to belong to is litter, and a PO that fails
+    # because Drive was slow is worse than one whose archive has a hole in it.
+    pending_files = list(context.user_data.get("attachments") or [])
+    if pending_files:
+        await attach_handlers.persist(context, po_no, pending_files, user)
     if draft.get("upload_id"):
         await asyncio.to_thread(sheets.log_upload_result,
                                 draft["upload_id"], "submitted", None, po_no)
@@ -941,10 +979,11 @@ def build_app():
     # The upload router must come BEFORE the generic one, or every "up:" tap is
     # swallowed with no error and nothing in the logs.
     upload_handlers.register(app, {"ask_reason": _ask_reason})
+    attach_handlers.register(app, {"ask_urgent": _ask_urgent})
     post_handlers.register(app, {"stock_checked": stock_checked})
     group_handlers.register(app)
     app.add_handler(CallbackQueryHandler(
-        on_callback, pattern=r"^(?!up:|sc:|bk:price:|rc:|cx:)"))
+        on_callback, pattern=r"^(?!up:|at:|sc:|bk:price:|rc:|cx:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(_on_error)
     return app

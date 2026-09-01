@@ -159,7 +159,21 @@ async def _send_template(q, context, idx):
 
 
 async def on_document(update, context):
+    # While the attach step is open, a document is a supporting document, not
+    # a new template. Routed here rather than registered separately because
+    # one handler per message type is what Telegram gives us, and two
+    # competing document handlers is a race nobody can read in the logs.
+    if context.user_data.get("state") == "attach":
+        import attach_handlers
+        await attach_handlers.on_document(update, context)
+        return
     doc = update.message.document
+    if doc is None:
+        # A photo, outside the attach step. Nothing here can read it.
+        await update.message.reply_text(
+            "Send /new to start a PO. Pictures are only accepted as "
+            "supporting documents, after the reason step.")
+        return
     if not doc.file_name.lower().endswith((".xlsx", ".xlsm")):
         await update.message.reply_text(
             "Please send the Excel template (.xlsx). Send /new if you need a "
@@ -311,7 +325,8 @@ async def _confirm(q, context):
 def register(app, hooks):
     _HOOKS.update(hooks)
     app.add_handler(MessageHandler(
-        filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
+        (filters.Document.ALL | filters.PHOTO) & filters.ChatType.PRIVATE,
+        on_document))
     app.add_handler(CallbackQueryHandler(_route, pattern=r"^up:"))
 
 
