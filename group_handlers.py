@@ -115,6 +115,8 @@ GROUP_CARDS = {
             "<b>This is the one you forward.</b>",
             "<code>PO_&lt;no&gt;_approval.pdf</code> \u2014 the same order plus "
             "every sign-off. <b>Internal. Do not forward.</b>",
+            "Supporting documents (quotation, spec, photo) arrive as replies "
+            "to the approval copy. <b>Internal \u2014 not for the supplier.</b>",
             "Short or over deliveries are reported here afterwards, so you can "
             "chase the supplier.",
         ],
@@ -123,7 +125,9 @@ GROUP_CARDS = {
     "cash": {
         "title": "Cash Advance",
         "role": "Information only \u2014 POs Finance routed to cash advance.",
-        "steps": ["Prices are shown here so the advance can be prepared."],
+        "steps": ["Prices are shown here so the advance can be prepared.",
+                  "Supporting documents (quotation, spec, photo) arrive as "
+                  "replies to the PO card."],
         "cmds": [("/chatid", "this group's ID")],
     },
 }

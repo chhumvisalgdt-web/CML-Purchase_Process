@@ -165,20 +165,28 @@ async def post_stage(context, po_no):
     await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{stage}.pdf", caption, parse, kb)
 
     # Supporting documents follow the card, and only to the stages allowed to
-    # see them. The stock controller is excluded because a quotation is a
-    # price; the approved-PO group because its job is to forward documents to
-    # the supplier. Config.attach_stages() enforces that, so a mistyped env
-    # var cannot open either door.
-    if stage in att.delivery_stages(po.get("category", ""), Config.attach_stages()):
-        await attach_handlers.deliver(context, po_no, stage, po,
-                                      po.get("requester_name", ""))
+    # see them. The stock controller never gets them because a quotation is a
+    # price; Config.attach_stages() enforces that, so a mistyped env var
+    # cannot open that door.
+    await _deliver_attachments(context, po_no, stage, po)
+
+
+async def _deliver_attachments(context, po_no, stage, po, card=None):
+    """Send the PO's supporting documents to `stage`, if it may receive them,
+    as replies to `card` when given."""
+    if stage not in att.delivery_stages(po.get("category", ""), Config.attach_stages()):
+        return 0
+    return await attach_handlers.deliver(
+        context, po_no, stage, po, po.get("requester_name", ""),
+        reply_to=getattr(card, "message_id", None))
 
 
 async def notify_group(context, po_no, chat_key, header, show_prices=True):
-    """Post a PO card (no buttons) to a group for information only."""
+    """Post a PO card (no buttons) to a group for information only.
+    Returns the sent message, or None if the group is not configured."""
     chat_id = Config.CHAT_IDS.get(chat_key)
     if not chat_id:
-        return
+        return None
     po = await asyncio.to_thread(sheets.get_po, po_no)
     items = await asyncio.to_thread(sheets.get_line_items, po_no)
     text = flow.po_summary(po, items, header=header, show_prices=show_prices)
@@ -187,7 +195,8 @@ async def notify_group(context, po_no, chat_key, header, show_prices=True):
     pdf = await asyncio.to_thread(generate_po_pdf, po, items,
                                   show_prices=show_prices, alternatives=alts,
                                   attachments=await _attachments(po_no))
-    await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{chat_key}.pdf", caption, parse)
+    return await _send_pdf(context, chat_id, pdf, f"PO_{po_no}_{chat_key}.pdf",
+                           caption, parse)
 
 
 async def finalize(context, po_no):
@@ -206,7 +215,11 @@ async def finalize(context, po_no):
         await notify_group(context, po_no, flow.STAGE_BOARD, fyi)
     await _post_approved(context, po_no, po)
     if str(po.get("payment_type", "")).strip() == flow.PAYMENT_LABEL["ca"]:
-        await notify_group(context, po_no, "cash", "\U0001f4b5 Cash Advance \u2014 approved")
+        card = await notify_group(context, po_no, "cash",
+                                  "\U0001f4b5 Cash Advance \u2014 approved")
+        # The card is the approved PO with its sign-off trail; the supporting
+        # documents hang under it so the advance can be prepared against them.
+        await _deliver_attachments(context, po_no, "cash", po, card)
     try:
         await context.bot.send_message(chat_id=int(po["requester_id"]),
                                         text=f"\U0001f389 PO #{po_no} is fully approved.")
@@ -240,13 +253,18 @@ async def _post_approved(context, po_no, po):
     approval = await asyncio.to_thread(generate_po_pdf, po, items,
                                        alternatives=await _alternatives(items),
                                        attachments=await _attachments(po_no))
+    approval_msg = None
     try:
-        await context.bot.send_document(
+        approval_msg = await context.bot.send_document(
             chat_id=chat_id, document=approval,
             filename=f"PO_{po_no}_approval.pdf",
             caption="Approval copy \u2014 internal. Do not forward.")
     except Exception as e:
         log.warning("Could not send approval copy for PO %s: %s", po_no, e)
+
+    # Supporting documents go with the approval copy, as replies to it --
+    # internal like it, and never part of the order that goes to the supplier.
+    await _deliver_attachments(context, po_no, "approved", po, approval_msg)
 
 
 # ===================== commands =====================

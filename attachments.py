@@ -12,9 +12,10 @@ Two rules are worth stating because they are the whole point of the module:
 
   * **Who sees a file is decided here, once.** `delivery_stages` filters the
     configured list against a hard ban, so a mistyped env var cannot walk a
-    supplier's price into the price-blind stock controller's group, or park a
-    competitor's quotation in the group whose job is to forward documents to
-    the supplier.
+    supplier's price into the price-blind stock controller's group. The
+    Approved POs and Cash Advance groups do receive the files, once the PO is
+    approved, as replies to the approval copy -- internal, like it, and never
+    part of the order that is forwarded to the supplier.
 
   * **A file is fingerprinted before it is delivered.** `sha256` goes on the
     record with the file, so the copy the Board saw can be proved to be the
@@ -41,9 +42,23 @@ ALLOWED_EXT = {
 }
 
 # Stages that can never receive an attachment, whatever the configuration says.
+# The stock controller is price-blind and a quotation is a price.
 # Mirrored in Config.ATTACH_NEVER; kept here too so the pure layer can be
 # tested and reasoned about without importing config.
-NEVER = ("stock", "approved", "cash")
+NEVER = ("stock",)
+
+# Flow order: the four review stages, then the two groups that receive the
+# approved PO. Also the order `audience_text` names them in.
+ORDER = ["book", "fin", "gm", "board", "approved", "cash"]
+
+AUDIENCE = {
+    "book": "Bookkeeping",
+    "fin": "the Finance manager",
+    "gm": "the GM",
+    "board": "the Board",
+    "approved": "the Approved POs group (with the approval copy)",
+    "cash": "the Cash Advance group (cash-advance POs only)",
+}
 
 
 def extension(name):
@@ -108,9 +123,19 @@ def delivery_stages(category, configured):
     decides and one place to test. An empty result is a valid answer: it means
     nothing is delivered, which is what a misconfiguration should degrade to.
     """
-    order = ["book", "fin", "gm", "board"]
     allowed = [s for s in configured if s not in NEVER]
-    return [s for s in order if s in allowed]
+    return [s for s in ORDER if s in allowed]
+
+
+def audience_text(configured):
+    """One sentence telling the requester where her documents will go."""
+    names = [AUDIENCE[s] for s in delivery_stages("", configured)]
+    if not names:
+        return "They are kept on file with the PO and not sent to any group."
+    joined = names[0] if len(names) == 1 else (
+        ", ".join(names[:-1]) + " and " + names[-1])
+    return (f"They go to {joined}. They are not sent to the stock controller, "
+            "and never to the supplier.")
 
 
 def caption(po_no, index, total, filename, requester=""):

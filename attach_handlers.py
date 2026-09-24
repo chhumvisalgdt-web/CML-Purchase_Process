@@ -21,7 +21,7 @@ row exists.
 import asyncio
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.ext import CallbackQueryHandler
 
 import attachments as att
@@ -59,8 +59,7 @@ async def ask(target, context):
         "a specification, a photo. Send them one at a time.\n\n"
         f"Optional. PDF, photo, Excel or Word; up to {Config.ATTACH_MAX_COUNT} "
         f"files, {Config.ATTACH_MAX_BYTES // 1048576} MB each.\n\n"
-        "They go to Bookkeeping, the Finance manager, the GM and the Board. "
-        "They are not sent to the stock controller and never to the supplier.",
+        + att.audience_text(Config.attach_stages()),
         reply_markup=_keyboard(0))
 
 
@@ -142,13 +141,20 @@ async def persist(context, po_no, files, user):
         return []
 
 
-async def deliver(context, po_no, stage, po, requester=""):
+async def deliver(context, po_no, stage, po, requester="", reply_to=None):
     """Send this PO's attachments to one stage group.
 
     The stage has already been checked against `att.delivery_stages`; this
     function trusts that and does the sending. A failure is logged and the PO
     carries on -- the approver has the PO card and can ask for the file.
+
+    `reply_to` is the message id the files should hang under. In the Approved
+    POs and Cash Advance groups that is the approval copy, so the files sit
+    with the PO that carries the approval, not with the order that is
+    forwarded to the supplier. If that message has gone, they still arrive.
     """
+    reply = (ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+             if reply_to else None)
     try:
         rows = await asyncio.to_thread(sheets.get_attachments, po_no)
     except Exception as e:
@@ -168,6 +174,7 @@ async def deliver(context, po_no, stage, po, requester=""):
                 filename=r.get("file_name") or None,
                 caption=att.caption(po_no, i, total, r.get("file_name", ""),
                                     requester),
+                reply_parameters=reply,
                 read_timeout=60, write_timeout=60, connect_timeout=20)
             sent += 1
         except Exception as e:

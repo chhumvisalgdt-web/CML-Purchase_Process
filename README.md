@@ -12,7 +12,7 @@ A Telegram bot that runs the CML purchase-order approval flow and stores everyth
    - **Not urgent** → General manager → Board of director → Approved.
    - **Urgent** → approved straight after Finance; GM and Board are notified only.
 6. Approved POs are posted to the **Approved POs** group (price-free), and additionally to the **Cash Advance** group when Finance chose that route.
-7. **Approved POs group** — receives two PDFs and forwards the order to the supplier.
+7. **Approved POs group** — receives two PDFs, plus any supporting documents as replies to the approval copy, and forwards only the order to the supplier.
 8. **Receiving** (stock controller group) — `/receive <po>` produces a file of the not-yet-received lines. Quantities are entered per line **per lot**, with lot number, expiry and the supplier's invoice number.
 9. The PO **closes** once every line is fully received or cancelled.
 
@@ -24,6 +24,8 @@ Approval is no longer terminal — a PO waits for delivery before it closes. Urg
 |---|---|---|
 | `PO_<no>.pdf` | Supplier code, the supplier's own item name, pack, qty, price, total | **Yes** — this is the order |
 | `PO_<no>_approval.pdf` | The same order plus every sign-off, the stock count, price changes and justifications | **No** — internal |
+
+Supporting documents (quotation, spec, photo) arrive as **replies to `PO_<no>_approval.pdf`** — internal, like it. Only `PO_<no>.pdf` goes to the supplier.
 
 Sending both, clearly named, removes the risk that someone forwards the internal file and the supplier sees your approval trail, your reference prices and your rejection reasons. Verified: the order copy contains no CML code, no approval trail and no reference price.
 
@@ -108,21 +110,22 @@ and a control that measures compliance instead of evidence.
 | Finance manager | Yes | Spending decision. |
 | General manager | Yes | Approves on price. |
 | Board of director | Yes | Approves on price. |
-| Approved POs | **No** | Its job is to forward documents to the supplier. A competitor's quotation in that thread is one tap from the supplier. |
-| Cash Advance | No | Payment routing, no review role. |
+| Approved POs | Yes | After approval, as **replies to the approval copy** — internal, like it. Only the order PDF goes to the supplier. |
+| Cash Advance | Yes | Cash-advance POs only, as replies to the PO card, so the advance is prepared against the quotation. |
 
-`ATTACH_STAGES` configures the first five, but `stock`, `approved` and `cash`
-are **stripped in code** (`Config.attach_stages`, `attachments.NEVER`) whatever
-the variable says. A leak there would be one careless env var, so the ban does
-not live in a comment. `attachments.delivery_stages` is the single place that
-decides, and a configuration of nothing but banned stages delivers nothing --
-a misconfiguration degrades to silence, never to a leak.
+`ATTACH_STAGES` chooses which groups receive them (all six above by default),
+but `stock` is **stripped in code** (`Config.attach_stages`,
+`attachments.NEVER`) whatever the variable says. A leak there would be one
+careless env var, so the ban does not live in a comment.
+`attachments.delivery_stages` is the single place that decides, and a
+configuration of nothing but the banned stage delivers nothing -- a
+misconfiguration degrades to silence, never to a leak.
 
 Files are collected in the DM but stored only once the PO number exists: an
 attachment with no PO to belong to is litter. Each is downloaded once,
 fingerprinted, archived, and thereafter **re-sent to each stage by Telegram
-`file_id`** rather than re-uploaded, so the four groups receive the identical
-file rather than four copies that could drift.
+`file_id`** rather than re-uploaded, so every group receives the identical
+file rather than copies that could drift.
 
 #### The record
 
@@ -138,6 +141,10 @@ eye. That fingerprint is the whole point: a year later it can prove that the
 file someone produces is the file the Board approved against.
 
 #### The Drive archive
+
+**Optional.** Delivery never uses Google Drive — every group receives the file
+through Telegram. Leave `ATTACHMENTS_FOLDER_ID` blank and the bot does not touch
+Drive at all; the trade-off is that Telegram then holds the only copy.
 
 Telegram holds the file and `file_id` points at it -- right up to the day
 someone clears the chat history, after which `sha256` can still prove a file is
@@ -298,7 +305,9 @@ pip install -r requirements.txt pytest && python -m pytest -q
 - `clock.py` — the single timezone-aware clock every timestamp comes from
 - `test_upload_validate.py`, `test_receipt_validate.py` — pure validation, and
   the rejection routing rules; 79 tests
-- `test_attachments.py` — attachment rules and the stage ban; 18 tests
+- `test_attachments.py` — attachment rules and the stage ban; 21 tests
+- `test_approved_attachments.py` — supporting documents reaching the Approved
+  POs and Cash Advance groups as replies to the approval copy; 8 tests
 - `test_reject_flow.py` — the rejection path end to end, with Sheets and
   Telegram replaced by recorders; 12 tests
 

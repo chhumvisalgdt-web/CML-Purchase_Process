@@ -2,16 +2,17 @@
 
 The routing tests are the ones that matter. Everything else here is input
 validation; `delivery_stages` is the wall between a supplier's quotation and
-the two groups that must never hold one.
+the price-blind stock controller.
 """
 import attachments as att
 from config import Config
 
 
 # ---------- who receives an attachment ----------
-def test_the_four_review_stages_receive_in_flow_order():
-    assert att.delivery_stages("Other", ["gm", "book", "board", "fin"]) == [
-        "book", "fin", "gm", "board"]
+def test_every_allowed_group_receives_in_flow_order():
+    assert att.delivery_stages(
+        "Other", ["cash", "gm", "approved", "book", "board", "fin"]) == [
+        "book", "fin", "gm", "board", "approved", "cash"]
 
 
 def test_the_stock_controller_never_receives_an_attachment():
@@ -20,27 +21,43 @@ def test_the_stock_controller_never_receives_an_attachment():
     assert "stock" not in att.delivery_stages("Other", ["stock", "fin"])
 
 
-def test_the_approved_po_group_never_receives_an_attachment():
-    """Its job is to forward documents to the supplier. A competitor's
-    quotation sitting in that thread is one tap from the supplier."""
-    assert "approved" not in att.delivery_stages("Other", ["approved", "fin"])
+def test_the_approved_po_group_receives_attachments():
+    assert "approved" in att.delivery_stages("Other", ["approved", "fin"])
 
 
-def test_the_cash_advance_group_never_receives_an_attachment():
-    assert "cash" not in att.delivery_stages("Other", ["cash", "gm"])
+def test_the_cash_advance_group_receives_attachments():
+    assert "cash" in att.delivery_stages("Other", ["cash", "gm"])
 
 
 def test_a_configuration_of_nothing_but_banned_stages_delivers_nothing():
     """A misconfiguration degrades to silence, never to a leak."""
-    assert att.delivery_stages("Other", ["stock", "approved", "cash"]) == []
+    assert att.delivery_stages("Other", ["stock"]) == []
 
 
 def test_config_filters_the_ban_before_the_list_is_ever_used():
-    Config.ATTACH_STAGES_RAW = ["book", "stock", "approved", "fin"]
+    saved = Config.ATTACH_STAGES_RAW
+    Config.ATTACH_STAGES_RAW = ["book", "stock", "approved", "cash", "fin"]
     try:
-        assert Config.attach_stages() == ["book", "fin"]
+        assert Config.attach_stages() == ["book", "approved", "cash", "fin"]
     finally:
-        Config.ATTACH_STAGES_RAW = ["book", "fin", "gm", "board"]
+        Config.ATTACH_STAGES_RAW = saved
+
+
+def test_the_requester_is_told_every_group_that_will_receive_her_files():
+    text = att.audience_text(["book", "fin", "gm", "board", "approved", "cash"])
+    for who in ("Bookkeeping", "Finance", "GM", "Board",
+                "Approved POs", "Cash Advance"):
+        assert who in text
+    assert "stock controller" in text and "never to the supplier" in text
+
+
+def test_the_requester_is_not_promised_a_group_that_is_switched_off():
+    text = att.audience_text(["book", "fin"])
+    assert "Approved POs" not in text and "Cash Advance" not in text
+
+
+def test_the_requester_is_told_when_no_group_receives_the_files():
+    assert "not sent to any group" in att.audience_text(["stock"])
 
 
 # ---------- what may be attached ----------

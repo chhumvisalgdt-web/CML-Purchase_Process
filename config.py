@@ -85,23 +85,24 @@ class Config:
     # Files the requester may attach to a PO so management can see the evidence
     # behind it -- a quotation, a spec sheet, a photo of the broken thing.
     #
-    # ATTACH_STAGES is deliberately not a free hand. Three stages can never
-    # receive an attachment however this is set (see Config.attach_stages):
-    # the stock controller is price-blind and a quotation is a price; the
-    # approved-PO group exists to forward documents to the supplier; the cash
-    # advance group has no review role. A leak there is one careless env var,
-    # so the ban lives in code rather than in a comment.
+    # ATTACH_STAGES is deliberately not a free hand. The stock controller can
+    # never receive an attachment however this is set (see
+    # Config.attach_stages): he is price-blind and a quotation is a price. A
+    # leak there is one careless env var, so the ban lives in code rather than
+    # in a comment. "approved" and "cash" receive the files after approval, as
+    # replies to the approval copy -- internal, never for the supplier.
     ATTACH_CATEGORIES = [c.strip().lower() for c in
                          os.environ.get("ATTACH_CATEGORIES", "other").split(",")
                          if c.strip()]
     ATTACH_STAGES_RAW = [s.strip().lower() for s in
-                         os.environ.get("ATTACH_STAGES", "book,fin,gm,board").split(",")
+                         os.environ.get("ATTACH_STAGES", "book,fin,gm,board,approved,cash").split(",")
                          if s.strip()]
-    ATTACH_NEVER = ("stock", "approved", "cash")
+    ATTACH_NEVER = ("stock",)
     ATTACH_MAX_COUNT = _to_int(os.environ.get("ATTACH_MAX_COUNT")) or 5
     ATTACH_MAX_BYTES = (_to_int(os.environ.get("ATTACH_MAX_MB")) or 10) * 1024 * 1024
-    # Google Drive folder that the service account has Editor on. Blank = no
-    # archive; attachments still work, they just live only in Telegram.
+    # Optional backup copy in Google Drive. Delivery never uses Drive -- files
+    # go to every group through Telegram. Blank = no Drive at all; the files
+    # then live only in Telegram.
     ATTACHMENTS_FOLDER_ID = os.environ.get("ATTACHMENTS_FOLDER_ID", "")
 
     @classmethod
